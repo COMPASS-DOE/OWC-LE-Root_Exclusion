@@ -1,0 +1,62 @@
+[Header]	
+System	TOC-L w TNM 9mL MULTIPLE INJ	
+S/W Version	1.00	
+User		
+Date/Time	2/24/2025 11:00:16 AM	
+
+[System]	
+Instrument Options	TOC/ASI/IC Unit/TN/	
+
+[Data]	
+Type	Anal.	Sample Name	Sample ID	Result(TOC)	Result(TC)	Result(IC)	Result(POC)	Result(NPOC)	Result(TN)	Unit	Vial	Date / Time	
+Unknown	NPOC/TN	CondBlank	Untitled					0.000	0.000	mg/L	1	2/20/2025 4:54:10 PM	
+Standard	NPOC	STD_0-50ppmNPOC	Untitled					50.00		mg/L	2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12	2/20/2025 8:32:51 PM	
+Standard	TN	STD_0-10ppmTN	Untitled						10.00	mg/L	13, 14, 15, 16, 17, 18, 19	2/20/2025 10:43:44 PM	
+Unknown	NPOC/TN	Blank1	Untitled					0.2406	0.1386	mg/L	20	2/20/2025 11:03:19 PM	
+Unknown	NPOC/TN	CKSTD1_1ppmNPOC	Untitled					1.027	0.1692	mg/L	21	2/20/2025 11:22:12 PM	
+Unknown	NPOC/TN	Blank2	Untitled					0.3089	0.1550	mg/L	22	2/20/2025 11:39:06 PM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_083	Untitled					9.625	0.7168	mg/L	49	2/20/2025 11:58:40 PM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_084	Untitled					6.673	0.6187	mg/L	50	2/21/2025 12:21:57 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_085	Untitled					13.06	1.176	mg/L	51	2/21/2025 12:45:32 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_086	Untitled					5.948	0.7267	mg/L	52	2/21/2025 1:08:33 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_087	Untitled					8.423	0.6792	mg/L	53	2/21/2025 1:33:30 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_3xdil_088	Untitled					6.767	0.7224	mg/L	54	2/21/2025 1:57:25 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_089	Untitled					9.004	0.7295	mg/L	55	2/21/2025 2:21:03 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_090	Untitled					27.19	1.050	mg/L	56	2/21/2025 2:46:38 AM	
+Unknown	NPOC/TN	Blank19	Untitled					0.4651	0.2721	mg/L	57	2/21/2025 3:05:02 AM	
+Unknown	NPOC/TN	CKSTD10_10ppmTN	Untitled					0.5400	10.68	mg/L	58	2/21/2025 3:29:30 AM	
+Unknown	NPOC/TN	Blank20	Untitled					0.5567	0.2997	mg/L	59	2/21/2025 3:50:46 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_091	Untitled					11.11	0.8142	mg/L	60	2/21/2025 4:14:22 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_092	Untitled					6.319	0.6157	mg/L	61	2/21/2025 4:37:01 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_093	Untitled					6.997	0.6739	mg/L	62	2/21/2025 4:59:57 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2.5xdil_094	Untitled					5.551	0.7930	mg/L	63	2/21/2025 5:22:28 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_095	Untitled					7.789	0.7241	mg/L	64	2/21/2025 5:47:03 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_096	Untitled					11.23	1.057	mg/L	65	2/21/2025 6:11:02 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_097	Untitled					6.835	0.8416	mg/L	66	2/21/2025 6:34:28 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_098	Untitled					6.661	0.6515	mg/L	67	2/21/2025 6:57:18 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_099	Untitled					5.662	0.6509	mg/L	68	2/21/2025 7:21:05 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_100	Untitled					18.15	1.468	mg/L	69	2/21/2025 7:47:23 AM	
+Unknown	NPOC/TN	Blank21	Untitled					0.6164	0.3452	mg/L	70	2/21/2025 8:06:25 AM	
+Unknown	NPOC/TN	CKSTD11_10ppmNPOC	Untitled					10.78	0.3466	mg/L	71	2/21/2025 8:28:48 AM	
+Unknown	NPOC/TN	Blank22	Untitled					0.5628	0.3164	mg/L	72	2/21/2025 8:46:54 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_101	Untitled					6.223	0.7846	mg/L	73	2/21/2025 9:11:31 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_102	Untitled					8.099	0.6905	mg/L	74	2/21/2025 9:35:22 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_103	Untitled					8.564	2.318	mg/L	75	2/21/2025 9:56:39 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_104	Untitled					7.637	0.9130	mg/L	76	2/21/2025 10:23:09 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_105	Untitled					6.168	0.6154	mg/L	77	2/21/2025 10:50:06 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_106	Untitled					5.767	0.6288	mg/L	78	2/21/2025 11:13:25 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_107	Untitled					14.57	1.161	mg/L	79	2/21/2025 11:37:22 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_108	Untitled					6.736	0.7419	mg/L	80	2/21/2025 11:56:03 AM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_109	Untitled					6.129	3.155	mg/L	81	2/21/2025 12:17:29 PM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_110	Untitled					10.05	0.8854	mg/L	82	2/21/2025 12:36:53 PM	
+Unknown	NPOC/TN	Blank23	Untitled					0.5408	0.2262	mg/L	83	2/21/2025 12:54:48 PM	
+Unknown	NPOC/TN	CKSTD12_10ppmTN	Untitled					0.4717	10.80	mg/L	84	2/21/2025 1:19:26 PM	
+Unknown	NPOC/TN	Blank24	Untitled					0.4543	0.2343	mg/L	85	2/21/2025 1:37:33 PM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_111	Untitled					5.326	1.988	mg/L	86	2/21/2025 2:03:26 PM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2.5xdil_112	Untitled					6.869	0.7756	mg/L	87	2/21/2025 2:27:53 PM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_113	Untitled					12.19	13.96	mg/L	88	2/21/2025 2:54:42 PM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_114	Untitled					6.138	3.022	mg/L	89	2/21/2025 3:21:19 PM	
+Unknown	NPOC/TN	COMPASS_Root_Exc_2xdil_115	Untitled					11.83	3.356	mg/L	90	2/21/2025 3:48:07 PM	
+Unknown	NPOC/TN	Blank25	Untitled					0.4583	0.2761	mg/L	91	2/21/2025 4:05:54 PM	
+Unknown	NPOC/TN	CKSTD13_10ppmNPOC	Untitled					10.22	0.2374	mg/L	92	2/21/2025 4:28:29 PM	
+Unknown	NPOC/TN	Blank26	Untitled					0.5031	0.2449	mg/L	93	2/21/2025 4:47:55 PM	
