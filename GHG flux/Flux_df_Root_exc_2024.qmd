@@ -1,0 +1,283 @@
+---
+title: "Flux_Root_exc_df"
+author: "Roberta Peixoto"
+format: html
+editor: visual
+---
+
+## Initializing
+
+```{r}
+require(pacman)
+p_load(tidyverse,
+       janitor,
+       parsedate,
+       lubridate,
+       cowplot, 
+       purrr,
+       readr, 
+       googledrive, 
+       zoo,
+       dplyr,
+       stringr,
+       purrr,
+       googlesheets4,
+       arrow,
+       ggplot2,
+       ggpubr,
+       data.table,
+       patchwork,
+       sjPlot,
+       Metrics,
+       yardstick,
+       lme4,
+       ggpmisc,
+       matrix)
+
+# Set ggplot theme
+theme_set(theme_bw())
+```
+
+#Flux combined dataframe
+
+```{r}
+
+directory_path <- "C:/Users/rbitten/OneDrive - University of Toledo/Documents/Multiplexer/OWC_root_exclusion/multiplexer_data"
+
+# filtering CSV files
+csv_files <- list.files(directory_path, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE)
+print(csv_files)
+
+# making a list 
+data_list <- list()
+error_files <- c()  
+headers <- NULL  
+
+for (file in csv_files) {
+  tryCatch({
+    if (file.info(file)$size > 0) {
+      # reading data without the head
+      data <- read_csv(file, col_names = FALSE, show_col_types = FALSE)
+            if (nrow(data) >= 3) {
+        # getting the head from the first file only
+        if (is.null(headers)) {
+          headers <- as.vector(unlist(data[2, ]))  # second line with a head
+        }
+                # removing useless lines
+        data <- data[-(1:3), ]
+        colnames(data) <- headers 
+        data_list[[length(data_list) + 1]] <- data
+      }
+    } else {
+      message(paste("Empty file:", file))
+    }
+  }, error = function(e) {
+    message(paste("Error processing file:", file, ":", e$message))
+    error_files <<- c(error_files, file)
+  })
+}
+
+# combining data without repeting head
+if (length(data_list) > 0) {
+  complete_data <- rbindlist(data_list, use.names = TRUE, fill = TRUE)
+  print(str(complete_data))
+} else {
+  message("no data.")
+}
+if (length(error_files) > 0) {
+  message("error files:")
+  print(error_files)
+} else {
+  message("no problem for these files.")
+}
+
+invalid_head_files <- c()
+
+for (file in csv_files) {
+  tryCatch({
+    if (file.info(file)$size > 0) {
+        data <- read_csv(file, col_names = FALSE, show_col_types = FALSE)
+      if (nrow(data) >= 2) {
+        headers <- as.vector(unlist(data[1, ]))  
+        if (any(is.na(headers)) || any(trimws(headers) == "")) {
+          invalid_head_files <- c(invalid_head_files, basename(file))
+        }
+      }
+    }
+  }, error = function(e) {
+  })
+}
+# which files have problem?
+if (length(invalid_head_files) > 0) {
+  cat("⚠️ invalid_head_files (NA ou empty):\n")
+  cat(paste("-", invalid_head_files, collapse = "\n"))
+} else {
+  cat("✅ Nno_inid_head_files\n")
+}
+
+# Removing empty columns
+data_combined <- complete_data[, 1:51, with = FALSE]
+
+colnames(data_combined) <- trimws(colnames(data_combined))
+
+#setting up date and time, converting the PORT to treat
+df_fluxroot2024 <- data_combined %>%
+    mutate(across(c(3, 5:51), ~ na_if(as.numeric(.), -9999)),
+        TIMESTAMP = as.POSIXct(paste0(DATE, TIME), format = "%Y%m%d%H%M%S"),
+        datetime=floor_date(TIMESTAMP, "hour"),
+        DATE = as.Date(DATE, format = "%Y%m%d"),
+        TIME = format(strptime(TIME, format = "%H%M%S"), "%H:%M:%S") ,
+        Treat = ifelse(PORT %in% c("1", "2", "3", "4"), "Control", 
+                       ifelse(PORT %in% c("5", "6", "7", "8"), "Root-free", PORT)),
+        Treat = as.factor(Treat)
+    ) 
+
+tz(df_fluxroot2024$TIMESTAMP)
+
+df_fluxroot2024b <-df_fluxroot2024 %>%mutate(
+    TIMESTAMP = force_tz(TIMESTAMP, tzone = "Etc/GMT+5"),
+    datetime  = floor_date(TIMESTAMP, unit = "hour")
+  )
+
+# Removing duplicates as same data seems to be saved in different files
+contagem_TIMESTAMP_port <- df_fluxroot2024b %>%
+  count(TIMESTAMP, PORT, name = "n_obs")
+
+df_fluxroot2024b <- df_fluxroot2024b %>%
+  arrange(TIMESTAMP) %>%
+  distinct(TIMESTAMP, .keep_all = TRUE)
+
+```
+
+#Flux QAQC
+
+```{r}
+#counting % of problems with sensor -9999 // n=147545
+percentages <- df_fluxroot2024b %>%
+  summarise(
+    perc_SD_FCH4_neg9999 = sum(FCH4 == -9999, na.rm = TRUE) / n() * 100, # 0%
+    perc_SD_FCO2_neg9999 = sum(FCO2 == -9999, na.rm = TRUE) / n() * 100,# 0%
+    perc_SD_FCO2_less_than_zero = sum(FCO2 <= 0, na.rm = TRUE) / n() * 100 # 7.49%
+  ) %>%
+  mutate(across(everything(), ~ round(.x, 2)))
+
+print(percentages)
+
+#checking how many problems were related to chamber not-working
+
+problematic_rows <- df_fluxroot2024b  %>%
+  mutate(
+    problem_SD_FCH4 = FCH4 == -9999,
+    problem_SD_FCO2_neg9999 = FCO2 == -9999,
+    problem_SD_FCO2_zero_or_neg = FCO2 <= 0
+  ) %>%
+  rowwise() %>%
+  mutate(total_problems = sum(c_across(starts_with("problem_")), na.rm = TRUE)) %>%
+  ungroup()
+
+multiple_problems <- sum(problematic_rows$total_problems > 1, na.rm = TRUE)
+
+isolated_problems <- sum(problematic_rows$total_problems == 1, na.rm = TRUE)
+
+cat("Number of lines with multiple problems:", multiple_problems, "\n") # 6535 
+cat("Number of lines with isolated problems:", isolated_problems, "\n") # 12073
+
+
+#number of observation with initial atm > 550 - we must increase the flushing time next experiment
+num_obs <- sum(df_fluxroot2024b$CO2_DRY > 550, na.rm = TRUE)
+total_obs <- sum(!is.na(df_fluxroot2024b$CO2_DRY))
+percentage <- (num_obs / total_obs) * 100
+print(percentage) # 29.19%
+
+#counting how many of these obs had good r2 -> we will keep them
+
+num_obs_CO2_DRY <- sum(df_fluxroot2024b$CO2_DRY > 550, na.rm = TRUE) #43079
+num_obs_both_conditions <- sum(df_fluxroot2024b$CO2_DRY > 550 & df_fluxroot2024$FCO2_R2 > 0.8, na.rm = TRUE) #30351
+percentage_both_conditions <- (num_obs_both_conditions / num_obs_CO2_DRY) * 100
+cat("Percentage of obs with R2 > 0.8 within CO2_DRY > 550:", round(percentage_both_conditions, 2), "%\n") #70.45% 
+
+#counting how many obs are outliers 
+
+mad_outlier <- function(x, ndev = 2.5) {
+  xmed <- median(x, na.rm = TRUE)  
+  xmad <- mad(x, na.rm = TRUE)     
+  xout <- abs(x - xmed) / xmad > ndev  
+  nexc <- sum(xout, na.rm = TRUE)  
+ 
+  message("Median = ", xmed, ", MAD = ", xmad, ", Threshold = ", ndev, 
+          ", Outliers = ", nexc, " of ", length(xout), 
+          " (", round(nexc / length(xout) * 100, 2), "%)")
+  xout
+}
+
+message("CO2_MAD:", appendLF = FALSE)
+outliers_FCO2 <- mad_outlier(df_fluxroot2024b$FCO2) 
+#Median = 2.64012, MAD = 3.0369148446, Threshold = 2.5, Outliers = 17903 of 161176 (11.11%)
+
+message("CH4_MAD:", appendLF = FALSE)   # Not removed as it could just be bubbles or high fluxes
+outliers_FCH4 <- mad_outlier(df_fluxroot2024b$FCH4) 
+#Median = -0.0878341, MAD = 0.44117861634, Threshold = 2.5, Outliers = 41703 of 161176 (25.87%)    
+
+df_root_clean2 <- df_fluxroot2024b %>%
+  mutate(FLAG_CO2_Outliers = outliers_FCO2,
+         FLAG_CH4_Outliers = outliers_FCH4)
+num_total <- nrow(df_root_clean2)
+num_outliers <- sum(df_root_clean2$FLAG_CH4_Outliers == TRUE, na.rm = TRUE)
+outlier_percentage <- (num_outliers / num_total) * 100 
+print(paste("Porcentagem de outliers em FLAG_CH4_Outliers: ", round(outlier_percentage, 2), "%")) #25.87%
+
+
+df_root_clean<-df_root_clean2 %>%
+  filter(FCH4!=-9999,
+         FCO2 !=-9999,
+         FCO2 >0,
+         !(CO2_DRY > 550 & FCO2_R2 < 0.8),
+         FCO2_R2 >0, #removing 6 weird obs
+         FCH4_R2 >0) #removing 14 weird obs
+
+df_root_clean$SWC_1[df_root_clean$SWC_1  == -9999] <- NA
+df_root_clean$TS_1 [df_root_clean$TS_1   == -9999] <- NA
+#df_root_clean$TS_1 [df_root_clean$TS_1   < 2] <- NA # not sure if we need this - there are 951 obs <0 oC and minimun is -2oC. It seems realistic to me!
+df_root_clean$SWC_1 [df_root_clean$SWC_1   < 0.03] <- 0.03 #below the dection limit are turning into zero
+
+#checking data
+
+ggplot(df_root_clean,
+       aes(x = datetime, y = FCH4, color = FLAG_CH4_Outliers)) +
+  geom_point() +
+  scale_x_continuous(breaks = seq(80, 355, by = 20)) +
+  scale_color_manual(
+    values = c("FALSE" = "red", "TRUE" = "blue"),
+    name = "Outliers"
+  ) +
+  labs(x = "Days of the year",
+      # y = bquote("Initial CO"[2]~conc~(mu*mol/mol)),
+       y= "CH4 flux (mu/m2/s)") +
+  theme_bw() +
+  facet_wrap(~Treat)
+
+
+# Selecting only the data that we are interesting on
+df_root_flux_2026 <- df_root_clean%>%
+   dplyr::select(DATE, TIME, DOY,PORT,Treat,FCH4,FCH4_R2,FCO2,FCO2_R2,SWC_1,TS_1,TIMESTAMP,datetime)%>%
+   filter(!is.na(FCH4))
+
+df_root_flux_2026<-df_root_flux_2026%>%
+  mutate(Treat=as.factor(Treat),
+         season = case_when(
+    DATE >= as.Date("2024-03-20") & DATE < as.Date("2024-06-22") ~ "Spring",
+    DATE >= as.Date("2024-06-22") & DATE < as.Date("2024-09-24") ~ "Summer",
+    DATE >= as.Date("2024-09-24") & DATE < as.Date("2024-12-22") ~ "Fall",
+    DATE >= as.Date("2024-12-22") & DATE < as.Date("2025-03-20") ~ "Winter",
+    DATE >= as.Date("2025-03-20") & DATE < as.Date("2025-06-22") ~ "Spring",
+    DATE >= as.Date("2025-06-22") & DATE < as.Date("2025-09-24") ~ "Summer"
+  ))
+
+tz(df_root_flux_2026$TIMESTAMP)
+tz(df_root_flux_2026$datetime)
+
+#write.csv(df_root_flux_2026 , "df_root_flux_2026.csv", row.names = FALSE)
+#df_root_flux_2026 <- read.csv("df_root_flux_2026.csv")
+#saveRDS(df_root_flux_2026, file = "df_root_flux_2026.rds")
+df_root_flux_2026<- readRDS("df_root_flux_2026.rds")
+```
