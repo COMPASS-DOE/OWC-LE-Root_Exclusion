@@ -251,7 +251,7 @@ stds_PO4 <- stds_PO4 %>%
     Sample_Name == "Standard 0" ~  0.0,
     Sample_Name == "Standard 1" ~  0.0,
     Sample_Name == "Standard 90" ~ 0.02,
-    Sample_Name == "Standard 91" ~ 0.05,
+    Sample_Name == "Standard 91" ~ 0.04,# RBP changed from 0.05 to 0.04 in 2/18/2026
     Sample_Name == "Standard 92" ~ 0.06,
     Sample_Name == "Standard 93" ~ 0.1,
     Sample_Name == "Standard 94" ~ 0.2,
@@ -667,6 +667,7 @@ red_eff <- df_all %>%
   filter(Sample_Name %in% c("Nitrate Standard", "Nitrite Standard"))
 
 red_eff$Eff_Percent <- (red_eff$Conc / 1)*100 ####Should we be dividing by 1 for this? These standards are 1 ppm NO3 and NO2. ####
+
 red_eff$Eff_flag <-  ifelse(red_eff$Eff_Percent >= 90, 'YES', 'NO, rerun')
 
 red_eff <- red_eff %>%
