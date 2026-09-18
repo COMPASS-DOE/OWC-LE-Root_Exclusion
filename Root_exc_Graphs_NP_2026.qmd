@@ -1,8 +1,12 @@
 ---
 title: "Root_exc_graphs"
 author: "Roberta Peixoto"
-format: html
-editor: visual
+date: today
+format:
+  pdf:
+    toc: true
+    number-sections: true
+output-dir: "GHG_LE_soil_trees/PDF"
 ---
 
 ## Initializing
@@ -78,12 +82,37 @@ print(p_usa_owc)
 
 # reading flux, sap, and L1 data created and QAQCedin a separated script
 df_root_flux_2026 <- readRDS("df_root_flux_2026.rds")
-df_ALL_sap_Js <- readRDS("df_ALL_sap_Js.rds")
+#df_ALL_sap_Js <- readRDS("df_ALL_sap_Js.rds")
 df_L1_root <- readRDS("df_L1_root.rds")
+df_sap_OWC<-readRDS("df_sap_OWC.rds") # created after QAQC all synoptic sites
 
 # merging gw, vpd with sap FOR FIG 2
+df_sap_OWC <- readRDS("df_sap_OWC.rds") %>%
+  mutate(
+    TIMESTAMP = ymd_hms(TIMESTAMP),
+    F = replace(F, !is.finite(F), NA_real_),
+    datetime = floor_date(TIMESTAMP, "hour")
+  ) %>%
+  filter(
+    Plot == "TR",
+    TIMESTAMP > as.POSIXct("2024-03-25 00:00:00"),
+    TIMESTAMP < as.POSIXct("2025-05-15 00:00:00")
+  ) %>%
+  group_by(datetime, Site, Plot, Sensor_ID) %>%
+  summarise(
+    across(
+      where(is.numeric),
+      ~ if (all(!is.finite(.x))) {
+        NA_real_
+      } else {
+        mean(.x[is.finite(.x)])
+      }
+    ),
+    .groups = "drop"
+  )
 
-df_L1_sap_vps_gw<-df_ALL_sap_Js%>%left_join(df_L1_root, by = "datetime")
+#df_L1_sap_vps_gw<-df_ALL_sap_Js%>%left_join(df_L1_root, by = "datetime")
+df_L1_sap_vps_gw<-df_sap_OWC%>%left_join(df_L1_root, by = "datetime")
 
 df_L1_sap_vps_gw<-df_L1_sap_vps_gw%>%
   mutate(gw_hour=100*gwl_median,              # transforming m to cm
@@ -113,6 +142,73 @@ L1_flux<-df_flux_hour%>%mutate(season = case_when(
       DATE >= as.Date("2025-03-20") & DATE < as.Date("2025-06-22") ~ "Spring",
       DATE >= as.Date("2025-06-22") & DATE < as.Date("2025-09-24") ~ "Summer"
     ))
+
+
+# =====================================================
+# DIAGNOSING AND REMOVING BAD TEMPERATURE RECORDS IN JULY
+# =====================================================
+
+# ---- 1) Diagnostic: confirm failure window in July, overall ----
+ts_july_fail_check <- L1_flux %>%
+  filter(month(datetime) == 7, TS_1 <= 1) %>%
+  arrange(datetime) %>%
+  summarise(first_bad = min(datetime), last_bad = max(datetime), n = n())
+
+print(ts_july_fail_check)
+
+# ---- 2) Same, broken down by PORT (window varies slightly: PORT 3 ends earlier) ----
+ts_july_fail_by_port <- L1_flux %>%
+  filter(month(datetime) == 7, TS_1 <= 1) %>%
+  group_by(PORT) %>%
+  summarise(first_bad = min(datetime), last_bad = max(datetime), n = n(), .groups = "drop") %>%
+  arrange(PORT)
+
+print(ts_july_fail_by_port)
+
+# ---- 3) Visual check: raw TS_1 by PORT, black = all data, red = flagged ----
+p_ts_raw_port <- ggplot(L1_flux, aes(x = datetime, y = TS_1)) +
+  geom_point(color = "black", alpha = 0.4, size = 0.8) +
+  geom_point(
+    data = L1_flux %>% filter(TS_1 <= 1),
+    color = "red", size = 1
+  ) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  facet_wrap(~ PORT, ncol = 2) +
+  labs(x = "Datetime", y = "Soil Temp - TS_1 (°C, raw)",
+       title = "Raw soil temperature by PORT",
+       subtitle = "Red = points with TS_1 <= 1") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_ts_raw_port)
+
+# ---- 4) Clean L1_flux: NA out TS_1 for the confirmed July failure window ----
+# Using the overall window (2024-07-11 10:00 to 2024-07-31 15:00), which
+# safely covers every PORT's individual failure window (PORT 3 recovers
+# earlier, on 2024-07-24, so it's simply unaffected after that date).
+ts_fail_start <- ts_july_fail_check$first_bad
+ts_fail_end   <- ts_july_fail_check$last_bad
+
+L1_flux <- L1_flux %>%
+  mutate(
+    TS_1_flag = if_else(datetime >= ts_fail_start & datetime <= ts_fail_end &
+                          TS_1 <= 1,
+                        "sensor_failure_july", "ok"),
+    TS_1 = if_else(TS_1_flag == "sensor_failure_july", NA_real_, TS_1)
+  )
+
+# ---- 5) Confirm cleaning worked ----
+L1_flux %>%
+  filter(TS_1_flag == "sensor_failure_july") %>%
+  summarise(n_flagged = n(), first = min(datetime), last = max(datetime))
+
+# Should return zero
+L1_flux %>%
+  filter(month(datetime) == 7, TS_1 <= 1) %>%
+  nrow()
 
 #averaging data per date-hour and treatment
 df_summary_hour <- L1_flux%>%
@@ -144,10 +240,15 @@ df_summary_hour <- L1_flux%>%
             median_gwl = median((gwl_median), na.rm = TRUE),
             IQR_gwl = IQR((gwl_median), na.rm = TRUE),
             
-            mean_sap =  mean(Js_kgcms, na.rm = TRUE),
-            sd_sap =  sd(Js_kgcms, na.rm = TRUE),
-            median_sap =  median(Js_kgcms, na.rm = TRUE),
-            IQR_sap=IQR(Js_kgcms, na.rm = TRUE),
+            # mean_sap =  mean(Js_kgcms, na.rm = TRUE),
+            # sd_sap =  sd(Js_kgcms, na.rm = TRUE),
+            # median_sap =  median(Js_kgcms, na.rm = TRUE),
+            # IQR_sap=IQR(Js_kgcms, na.rm = TRUE),
+            
+            mean_sap =  mean(F, na.rm = TRUE),
+            sd_sap =  sd(F, na.rm = TRUE),
+            median_sap =  median(F, na.rm = TRUE),
+            IQR_sap=IQR(F, na.rm = TRUE),
             
             mean_vpd = mean((VPD_hour), na.rm = TRUE),
             sd_vpd = sd((VPD_hour), na.rm = TRUE),
@@ -269,7 +370,7 @@ plot_FCH4_doy <- ggplot(df_one_year, aes(x = datetime, y = median_FCH4, color = 
 
 
 
-plot_gwl_doy<-ggplot(df_one_year, aes(x = datetime, y = median_gwl )) +
+plot_gwl_doy<-ggplot(df_one_year, aes(x = datetime, y = median_gwl*100 )) +
     geom_point(position = position_dodge(width = 0.5)) +
      geom_ribbon(aes(ymin = median_gwl  - IQR_gwl , ymax = median_gwl  + IQR_gwl ),
                 alpha = 0.2, linetype="blank") +  
@@ -402,19 +503,53 @@ redox_plot <- ggplot(redox_df, aes(x = datetime, y = redox_mV+200, color = Treat
 ##################  SAP FLOW
 
 # using original df as summarise is messing with the sapflow dataset 
-df_sap_Js_midday <- df_ALL_sap_Js %>%
-    filter(hour >= 11 & hour < 14,
-           datetime<="2025-01-14 16:00:00 UTC"& datetime>="2024-04-05 15:00:00 UTC")
+#df_sap_Js_midday <- df_ALL_sap_Js %>%
+#    filter(hour >= 11 & hour < 14,
+#           datetime<="2025-01-14 16:00:00 UTC"& datetime>="2024-04-05 15:00:00 UTC")
     
 #averaging data per datetime - loosing sensor ID here
-df_sap_midday_mean<-df_sap_Js_midday%>%
-    group_by(datetime)%>%
-    summarise(median_Js_kgm2s=median(Js_kgcms),
-              IQR_Js_kgm2s=IQR(Js_kgcms))
+# df_sap_midday_mean<-df_sap_Js_midday%>%
+#     group_by(datetime)%>%
+#     summarise(median_Js_kgm2s=median(Js_kgcms),
+#               IQR_Js_kgm2s=IQR(Js_kgcms))
+# 
+# sap_plot<-ggplot(df_sap_midday_mean, aes(x = datetime, y = median_Js_kgm2s)) +
+#   geom_ribbon(aes(ymin = median_Js_kgm2s - IQR_Js_kgm2s,
+#                   ymax = median_Js_kgm2s + IQR_Js_kgm2s),
+#               fill = "#7AD151FF", alpha = 0.2) +
+#   geom_point(color = "#7AD151FF", size =1.5) +
+#   geom_smooth(method = "gam", formula = y ~ s(x, k = 10),
+#             color = "#7AD151FF", fill = "#7AD151FF", se = TRUE)+
+#   geom_vline(xintercept = season_division_dates,
+#              linetype = "dashed", color = "darkgray", linewidth = 0.5)+
+#   scale_y_continuous(
+#   limits = c(0, 0.003),
+#   breaks = seq(0, 0.003, by = 0.001),
+#   labels = scales::number_format(accuracy = 0.001)
+# ) +
+#   scale_x_datetime(limits = c(x_min, x_max),
+#                       breaks = seq(x_min, x_max, by = "20 days")) +
+#   theme_bw()+labs(
+#     x = NULL,
+#     y = bquote(atop("Sapflow", ~kg ~ m^{-2} ~ s^{-1}))
+#   ) +
+#   theme(
+#     legend.position = "none", 
+#     panel.grid = element_blank(),
+#     text = element_text(size = 20),
+#     axis.text.x = element_blank())
 
-sap_plot<-ggplot(df_sap_midday_mean, aes(x = datetime, y = median_Js_kgm2s)) +
-  geom_ribbon(aes(ymin = median_Js_kgm2s - IQR_Js_kgm2s,
-                  ymax = median_Js_kgm2s + IQR_Js_kgm2s),
+df_summary_hour_mean<-df_sap_OWC%>%
+  filter(  hour>=11&hour<=14,
+           datetime<="2025-01-14 16:00:00 UTC"& 
+            datetime>="2024-04-05 15:00:00 UTC")%>%
+    group_by(datetime)%>%
+    summarise(median_F=median(F, na.rm=TRUE),
+              IQR_F=IQR(F, na.rm=TRUE))
+
+sap_plot<-ggplot(df_summary_hour_mean, aes(x = datetime, y = median_F)) +
+  geom_ribbon(aes(ymin = median_F - IQR_F,
+                  ymax = median_F + IQR_F),
               fill = "#7AD151FF", alpha = 0.2) +
   geom_point(color = "#7AD151FF", size =1.5) +
   geom_smooth(method = "gam", formula = y ~ s(x, k = 10),
@@ -437,7 +572,6 @@ sap_plot<-ggplot(df_sap_midday_mean, aes(x = datetime, y = median_Js_kgm2s)) +
     panel.grid = element_blank(),
     text = element_text(size = 20),
     axis.text.x = element_blank())
-
 
 Fig_2_all_data_plot <- plot_FCH4_doy / plot_swc_doy / sap_plot / plot_gwl_doy / redox_plot / plot_rain_doy +
   plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 15))
@@ -581,7 +715,8 @@ winter_SWC <- make_boxplot(df_one_year, "Winter", median_SWC,
 fig3_boxplot <- ggarrange(
   spring, summer, fall, winter,
   spring_SWC, summer_SWC, fall_SWC, winter_SWC,
-  ncol = 4, nrow = 2
+  ncol = 4, nrow = 2,
+  align = "hv"
 )
 
 print(fig3_boxplot)
@@ -716,9 +851,202 @@ ggplot(L1_flux_cumulative, aes(x = datetime, y = FCH4_cum, color = factor(Treat)
               maxFCH4_cum= max(FCH4_cum),
               minFCH4_cum= min(FCH4_cum)), .groups = "drop") 
 
+   
+  
 ```
 
-## Fig 4 - cumulative flux
+## Fig S1: SM gap filled distribution
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(patchwork)
+
+# =====================================================
+# DAILY RAINFALL
+# =====================================================
+
+df_rain_daily <- df_rain %>%
+  mutate(date = as.Date(datetime)) %>%
+  group_by(date) %>%
+  summarise(
+    rain_daily = sum(rain_sum, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(datetime = as.POSIXct(date))
+
+# =====================================================
+# CH4 FLUX
+# =====================================================
+
+plot_flux <- ggplot() +
+
+  geom_point(
+    data = filter(L1_flux_complete, gap_flag == 2),
+    aes(datetime, FCH4_GP),
+    color = "blue",
+    size = 0.5,
+    alpha = 0.7
+  ) +
+
+  geom_point(
+    data = filter(L1_flux_complete, gap_flag == 1),
+    aes(datetime, FCH4_GP),
+    color = "red",
+    size = 0.5,
+    alpha = 0.7
+  ) +
+
+  geom_point(
+    data = filter(L1_flux_complete, gap_flag == 0),
+    aes(datetime, FCH4_GP),
+    color = "black",
+    size = 0.5,
+    alpha = 0.7
+  ) +
+
+  facet_wrap(~Treat, ncol = 1) +
+
+  geom_vline(
+    xintercept = season_division_dates,
+    linetype = "dashed",
+    colour = "darkgrey"
+  ) +
+
+  scale_x_datetime(
+    limits = c(x_min, x_max),
+    breaks = seq(x_min, x_max, by = "20 days")
+  ) +
+
+  labs(
+    x = NULL,
+    y = expression(CH[4]~Flux~(mu*mol~m^{-2}~h^{-1})),
+    title = "Observed and Gap-filled Methane Flux"
+  ) +
+
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    strip.text = element_text(size = 14, face = "bold"),
+    plot.title = element_text(face = "bold")
+  ) +ylim(-20000,20000)
+
+# =====================================================
+# GROUNDWATER LEVEL
+# =====================================================
+
+plot_gwl <- ggplot(
+  df_one_year,
+  aes(datetime, median_gwl * 100)
+) +
+
+  geom_ribbon(
+    aes(
+      ymin = (median_gwl - IQR_gwl) * 100,
+      ymax = (median_gwl + IQR_gwl) * 100
+    ),
+    fill = "steelblue",
+    alpha = 0.25
+  ) +
+
+  geom_line(
+    colour = "steelblue4",
+    linewidth = 0.7
+  ) +
+
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    colour = "darkgrey"
+  ) +
+
+  geom_vline(
+    xintercept = season_division_dates,
+    linetype = "dashed",
+    colour = "darkgrey"
+  ) +
+
+  scale_x_datetime(
+    limits = c(x_min, x_max),
+    breaks = seq(x_min, x_max, by = "20 days")
+  ) +
+
+  labs(
+    x = NULL,
+    y = "Water table\n(cm)",
+    title = "Groundwater Level Dynamics"
+  ) +
+
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# =====================================================
+# DAILY RAIN
+# =====================================================
+
+plot_rain <- ggplot(
+  df_rain_daily,
+  aes(datetime, rain_daily)
+) +
+
+  geom_col(
+    fill = "black",
+    width = 86400
+  ) +
+
+  geom_vline(
+    xintercept = season_division_dates,
+    linetype = "dashed",
+    colour = "darkgrey"
+  ) +
+
+  scale_x_datetime(
+    limits = c(x_min, x_max),
+    breaks = seq(x_min, x_max, by = "20 days"),
+    labels = scales::date_format("%d-%b")
+  ) +
+
+  labs(
+    x = "Date",
+    y = "Daily rainfall\n(mm)",
+    title = "Daily Rainfall"
+  ) +
+
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      size = 12
+    ),
+    plot.title = element_text(face = "bold")
+  )
+
+# =====================================================
+# COMBINED FIGURE
+# =====================================================
+
+final_plot <-
+  plot_flux /
+  plot_gwl /
+  plot_rain +
+  plot_layout(
+    heights = c(4, 1.5, 1.2)
+  )
+
+final_plot
+
+```
+
+## Fig 5 - cumulative flux
 
 ```{r}
 
@@ -753,13 +1081,137 @@ Cumulative_plot<-ggplot(L1_flux_cumulative, aes(x = datetime, y = (FCH4_cum*16*1
 print(Cumulative_plot)
 ```
 
-## Fig 5 - hourly graphs summer
+## Fig 6 - hourly graphs summer
 
 ```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
 
+# ---- Month levels for faceting (columns) ----
+month_levels <- c("July", "August", "September", "October")
+
+treatment_colors <- c("Control" = "#7AD151FF", "Root-free" = "#440154FF")
+
+# ---- Climatology base: hour-of-day median per month, per Treat ----
+df_climatology <- df_one_year %>%
+  mutate(month = lubridate::month(datetime, label = TRUE, abbr = FALSE),
+         hour  = lubridate::hour(datetime)) %>%
+  filter(month %in% month_levels) %>%
+  mutate(month = factor(month, levels = month_levels))
+
+ch4_summary <- df_climatology %>%
+  group_by(month, hour, Treat) %>%
+  summarise(median_val = median(median_FCH4, na.rm = TRUE),
+            .groups = "drop")
+
+swc_summary <- df_climatology %>%
+  group_by(month, hour, Treat) %>%
+  summarise(median_val = median(median_SWC, na.rm = TRUE),
+            .groups = "drop")
+
+ts_summary <- df_climatology %>%
+  group_by(month, hour, Treat) %>%
+  summarise(median_val = median(median_TS, na.rm = TRUE),
+            .groups = "drop")
+
+# ---- Sap flow: no Treat split, black point / gray smooth ----
+sap_summary <- df_sap_OWC %>%
+  mutate(month = lubridate::month(datetime, label = TRUE, abbr = FALSE),
+         hour  = lubridate::hour(datetime)) %>%
+  filter(month %in% month_levels) %>%
+  mutate(month = factor(month, levels = month_levels)) %>%
+  group_by(month, hour) %>%
+  summarise(median_val = median(F, na.rm = TRUE),
+            .groups = "drop")
+
+# ---- Generic hourly panel builder ----
+make_hourly_plot <- function(df, ylab, treatment = TRUE,
+                             show_x_axis = FALSE, show_strip = FALSE,
+                             ylim_vals = NULL, y_breaks = NULL) {
+  
+  if (treatment) {
+    g <- ggplot(df, aes(x = hour, y = median_val, color = Treat, fill = Treat)) +
+      geom_smooth(method = "loess", se = TRUE, alpha = 0.2) +
+      geom_point(size = 2) +
+      scale_color_manual(values = treatment_colors, name = "Treatment") +
+      scale_fill_manual(values = treatment_colors, name = "Treatment")
+  } else {
+    g <- ggplot(df, aes(x = hour, y = median_val)) +
+      geom_smooth(method = "loess", se = TRUE,
+                  color = "black", fill = "gray50", alpha = 0.3) +
+      geom_point(color = "black", size = 2)
+  }
+  
+  g <- g +
+    geom_vline(xintercept = c(9, 15), linetype = "dotted",
+               color = "black", linewidth = 0.6) +
+    facet_wrap(~ month, nrow = 1) +
+    scale_x_continuous(breaks = seq(0, 21, by = 3), limits = c(0, 23)) +
+    labs(x = if (show_x_axis) "Hour of day" else NULL, y = ylab) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      text = element_text(size = 18),
+      axis.text.x = if (show_x_axis) element_text(size = 14) else element_blank(),
+      strip.background = element_rect(fill = "white", color = "black"),
+      strip.text = if (show_strip) element_text(size = 16, face = "bold") else element_blank()
+    )
+  
+  if (!is.null(ylim_vals)) g <- g + coord_cartesian(ylim = ylim_vals)
+  if (!is.null(y_breaks))  g <- g + scale_y_continuous(breaks = y_breaks)
+  
+  return(g)
+}
+
+# ---- Build the 4 rows ----
+p_ch4 <- make_hourly_plot(
+  ch4_summary,
+  ylab = bquote(atop("CH"[4] ~ "flux", ~ mu*mol ~ m^{-2} ~ s^{-1})),
+  treatment = TRUE, show_x_axis = FALSE, show_strip = TRUE,
+  ylim_vals = c(-2, 0.3)
+)
+
+p_swc <- make_hourly_plot(
+  swc_summary,
+  ylab = bquote(atop("Soil moisture", ~m^3 ~ m^{-3})),
+  treatment = TRUE, show_x_axis = FALSE, show_strip = FALSE,
+  y_breaks = seq(0, 0.55, by = 0.1)
+)
+
+p_ts <- make_hourly_plot(
+  ts_summary,
+  ylab = "Soil Temp \n°C",
+  treatment = TRUE, show_x_axis = FALSE, show_strip = FALSE,
+  ylim_vals = c(10, 25)
+)
+
+p_sap <- make_hourly_plot(
+  sap_summary,
+  ylab = bquote(atop("Sapflow", ~kg ~ m^{-2} ~ s^{-1})),
+  treatment = FALSE, show_x_axis = TRUE, show_strip = FALSE,
+  y_breaks = seq(0, 0.0025, by = 0.001)
+)
+
+# ---- Combine with a single collected, horizontal top legend ----
+Fig_hourly <- p_ch4 / p_swc / p_ts / p_sap +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "top", legend.title = element_blank())
+
+print(Fig_hourly)
+
+ggsave(
+  filename = "fig_hourly_climatology.png",
+  plot = Fig_hourly,
+  width = 14,
+  height = 12,
+  dpi = 300,
+  bg = "white"
+)
 ```
 
-## Fig S1 - hourly graphs per month/y
+## Fig not used - hourly graphs per month/y
 
 ```{r}
 
@@ -1030,7 +1482,8 @@ df_mixed <- L1_flux %>%
   summarise(
     FCH4    = median(FCH4, na.rm = TRUE),
     FCO2    = median(FCO2, na.rm = TRUE),
-    SapFlow = median(Js_kgcms, na.rm = TRUE),
+    #SapFlow = median(Js_kgcms, na.rm = TRUE),
+    SapFlow = median(F, na.rm = TRUE),
     Rain    = sum(rain_sum, na.rm = TRUE),
     Temp    = median(TS_1, na.rm = TRUE),
     SWC     = median(SWC_1, na.rm = TRUE),
@@ -1044,7 +1497,8 @@ df_mixed <- L1_flux %>%
 df_mixed$Treat <- factor(df_mixed$Treat)
 df_mixed$PORT  <- factor(df_mixed$PORT)
 
-cont_vars <- c("FCH4","FCO2","SapFlow","Rain","Temp","SWC","GWL","VPD")
+cont_vars <- c("FCH4",#"FCO2",
+               "SapFlow","Rain","Temp","SWC","GWL","VPD")
 df_mixed_scaled <- df_mixed
 df_mixed_scaled[cont_vars] <- scale(df_mixed[cont_vars])
 
@@ -1055,7 +1509,7 @@ treatments <- levels(df_mixed_scaled$Treat)
 model_list <- list()
 for(tr in treatments){
   df_sub <- df_mixed_scaled %>% filter(Treat == tr)
-  model <- lmer(FCH4 ~ Temp + SWC + GWL + VPD + SapFlow + Rain + FCO2 +
+  model <- lmer(FCH4 ~ Temp + SWC + GWL + VPD + SapFlow + Rain + #FCO2 +
                   (1|PORT) + (1|Date),
                 data = df_sub, REML = TRUE)
   model_list[[tr]] <- model
@@ -1189,4 +1643,225 @@ nut_summary <- nut_clean %>%
 
 
 print(nut_summary)
+
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+# ==========================================
+# COLORS
+# ==========================================
+
+treatment_colors <- c(
+  "Control"   = "#7AD151FF",
+  "Root-free" = "#440154FF"
+)
+
+# ==========================================
+# CLEAN DATA
+# ==========================================
+
+nut_clean <- nut %>%
+  mutate(
+    Treat = case_when(
+      str_detect(Sample.ID, "trC") ~ "Control",
+      str_detect(Sample.ID, "trE") ~ "Root-free",
+      TRUE ~ NA_character_
+    ),
+
+    Depth = case_when(
+      str_detect(Sample.ID, "10cm") ~ "10 cm",
+      str_detect(Sample.ID, "20cm") ~ "20 cm",
+      str_detect(Sample.ID, "40cm") ~ "40 cm",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(Treat),
+    !is.na(Depth)
+  )
+
+# ==========================================
+# MEDIAN + IQR
+# ==========================================
+
+nut_summary <- nut_clean %>%
+  group_by(Test, Treat, Depth) %>%
+  summarise(
+    median = median(Results, na.rm = TRUE),
+    IQR = IQR(Results, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+# depth order so 10 cm is on top
+
+nut_summary$Depth <- factor(
+  nut_summary$Depth,
+  levels = c("40 cm", "20 cm", "10 cm")
+)
+
+# ==========================================
+# PLOT
+# ==========================================
+
+nut_plot <- ggplot(
+  nut_summary,
+  aes(
+    x = median,
+    y = Depth,
+    colour = Treat
+  )
+) +
+
+  geom_errorbarh(
+    aes(
+      xmin = pmax(0, median - IQR/2),
+      xmax = median + IQR/2
+    ),
+    height = 0.18,
+    linewidth = 0.8,
+    position = position_dodge(width = 0.45)
+  ) +
+
+  geom_point(
+    size = 4,
+    position = position_dodge(width = 0.45)
+  ) +
+
+  facet_wrap(
+    ~Test,
+    scales = "free_x",
+    ncol = 3
+  ) +
+
+  scale_colour_manual(
+    values = treatment_colors
+  ) +
+
+  labs(
+    x = "Concentration",
+    y = "Depth",
+    colour = "Treatment"
+  ) +
+
+  theme_bw() +
+
+  theme(
+    panel.grid = element_blank(),
+
+    legend.position = "top",
+
+    strip.background = element_blank(),
+
+    strip.text = element_text(
+      size = 13,
+      face = "bold"
+    ),
+
+    axis.title = element_text(size = 14),
+
+    axis.text = element_text(size = 12),
+
+    legend.text = element_text(size = 12),
+
+    legend.title = element_text(size = 12)
+  )
+
+nut_plot
+
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+# ==========================================
+# Colors
+# ==========================================
+
+treatment_colors <- c(
+  "Control"   = "#7AD151FF",
+  "Root-free" = "#440154FF"
+)
+
+# ==========================================
+# Clean data
+# ==========================================
+
+nut_clean <- nut %>%
+  mutate(
+    Treat = case_when(
+      str_detect(Sample.ID, "trC") ~ "Control",
+      str_detect(Sample.ID, "trE") ~ "Root-free",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Treat))
+
+# check nutrients present
+unique(nut_clean$Test)
+
+# ==========================================
+# Boxplots
+# ==========================================
+
+nut_plot <- ggplot(
+  nut_clean,
+  aes(
+    x = Treat,
+    y = Results,
+    fill = Treat
+  )
+) +
+
+  geom_boxplot(
+    width = 0.6,
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+
+  geom_jitter(
+    width = 0.15,
+    size = 1.8,
+    alpha = 0.7,
+    color = "black"
+  ) +
+
+  facet_wrap(
+    ~ Test,
+    scales = "free_y",
+    ncol = 3
+  ) +
+
+  scale_fill_manual(
+    values = treatment_colors
+  ) +
+
+  labs(
+    x = NULL,
+    y = "Concentration",
+    fill = "Treatment"
+  ) +
+
+  theme_bw() +
+
+  theme(
+    panel.grid = element_blank(),
+
+    legend.position = "none",
+
+    strip.background = element_blank(),
+
+    strip.text = element_text(
+      size = 14,
+      face = "bold"
+    ),
+
+    axis.title = element_text(size = 14),
+
+    axis.text = element_text(size = 12)
+  )
+
+nut_plot
 ```
