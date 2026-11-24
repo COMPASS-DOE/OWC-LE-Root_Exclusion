@@ -1,0 +1,947 @@
+---
+title: "Root exclusion OWC: 01 prepare datasets"
+author: "Roberta Peixoto"
+date: today
+format:
+  html:
+    toc: true
+    number-sections: true
+---
+
+# Setup
+
+```{r setup}
+#| message: false
+require(pacman)
+p_load(tidyverse, lubridate, janitor, zoo, arrow, here, MODISTools, MASS)
+select <- dplyr::select   # MASS masks dplyr::select
+
+# ---- Input folder (same convention as root_exc_graphs_full.qmd) ---------------------
+# data_dir = folder with the raw inputs, found automatically as the first folder that
+# contains df_root_flux_2026.rds. To set it by hand, replace NULL with the path.
+# The raw inputs (LI-COR/COMPASS drive) are too large for GitHub: I keep them
+# in the Google Drive folder synced to this computer and point data_dir there
+data_dir <- NULL
+key_file <- "df_root_flux_2026.rds"
+
+if (is.null(data_dir)) {
+  qmd_dir <- tryCatch(dirname(knitr::current_input(dir = TRUE)), error = function(e) character(0))
+  if (length(qmd_dir) == 0 && requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable())
+    qmd_dir <- tryCatch(dirname(rstudioapi::getSourceEditorContext()$path), error = function(e) character(0))
+  cands <- unique(c(qmd_dir, getwd(), here::here(), file.path(here::here(), "data", "raw")))
+  hit   <- cands[file.exists(file.path(cands, key_file))]
+  if (length(hit) == 0)
+    hit <- dirname(list.files(here::here(), pattern = paste0("^", key_file, "$"),
+                              recursive = TRUE, full.names = TRUE))
+  if (length(hit) == 0) stop("Could not find ", key_file, ": set data_dir by hand at the top of the script.")
+  data_dir <- hit[1]
+}
+data_dir <- normalizePath(data_dir, winslash = "/")
+message("Input folder: ", data_dir)
+
+# Path of an input file: data_dir first, then the project root. must_exist = FALSE returns
+# the path in data_dir for files the script creates itself (downloads saved once).
+dfile <- function(name, must_exist = TRUE) {
+  cands <- file.path(unique(c(data_dir, here::here())), name)
+  hit   <- cands[file.exists(cands)]
+  if (length(hit) > 0) return(hit[1])
+  if (must_exist) stop("File not found: ", name, "\n  looked in: ",
+                       paste(dirname(cands), collapse = " | "), call. = FALSE)
+  file.path(data_dir, name)
+}
+
+# Data kept outside the project (other drives). Only this file reads them; the analysis
+# file reads the processed copies (wells_hourly, nutrients_soil).
+compass_dir <- "D:/COMPASS_L2-v2-1"
+nut_file    <- "C:/Users/rbitten/OneDrive - University of Toledo/Documents/Multiplexer/Nutrients/raw_data_AQ700/nutrients_combined.csv"
+
+# ---- Output folder: the final datasets ---------------------------------------------
+# Default: <project root>/data/processed. To set it by hand, replace NULL with the path.
+out_dir <- NULL
+if (is.null(out_dir)) out_dir <- file.path(here::here(), "data", "processed")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+out_dir <- normalizePath(out_dir, winslash = "/")
+message("Output folder: ", out_dir)
+
+# TRUE: also writes each table as CSV to a temporary file, only to compare sizes
+# (the CSV is deleted; only the Parquet is kept). Set FALSE once the format is decided.
+compare_formats <- TRUE
+
+# ---- Saving helper ------------------------------------------------------------------
+# Writes one Parquet file (zstd compression), reads it back to check rows, columns and
+# date-times (instants and time zone), and logs it for data_dictionary.csv.
+# Parquet keeps column types (Date, POSIXct with time zone, factor levels), which CSV loses.
+ds_log <- list()
+save_ds <- function(df, name, description) {
+  df   <- dplyr::ungroup(tibble::as_tibble(df))
+  path <- file.path(out_dir, paste0(name, ".parquet"))
+  arrow::write_parquet(df, path, compression = "zstd")
+
+  back <- arrow::read_parquet(path)
+  stopifnot(nrow(back) == nrow(df), identical(names(back), names(df)))
+  for (v in names(df)[vapply(df, inherits, logical(1), what = "POSIXct")]) {
+    if (!isTRUE(all.equal(as.numeric(df[[v]]), as.numeric(back[[v]]))))
+      stop(name, ": date-time column ", v, " changed after saving")
+    if (!identical(attr(df[[v]], "tzone"), attr(back[[v]], "tzone")))
+      warning(name, ": time zone of ", v, " is '", attr(df[[v]], "tzone"), "' in R and '",
+              attr(back[[v]], "tzone"), "' in the file (same instants; check the clock time)")
+  }
+
+  csv_kb <- NA_real_
+  if (compare_formats) {
+    tmp <- tempfile(fileext = ".csv")
+    readr::write_csv(df, tmp)
+    csv_kb <- file.size(tmp) / 1024
+    unlink(tmp)
+  }
+  ds_log[[name]] <<- tibble(file = basename(path), description = description,
+                            n_rows = nrow(df), n_cols = ncol(df),
+                            parquet_kb = round(file.size(path) / 1024), csv_kb = round(csv_kb),
+                            columns = paste(names(df), collapse = ", "))
+  message(sprintf("saved %-38s %8d rows %4d cols %8.0f KB", basename(path), nrow(df), ncol(df),
+                  file.size(path) / 1024))
+  invisible(path)
+}
+```
+
+# Parameters
+
+```{r parameters}
+# Same values as in root_exc_graphs_full.qmd ("Setup df for analysis"). They define the
+# periods and quality filters used to build the datasets. The analysis file needs the
+# same values: they are also saved as study_parameters.parquet at the end.
+study_start  <- as.POSIXct("2024-04-05 15:00:00") # first and last flux measurements (hourly data)
+study_end    <- as.POSIXct("2025-01-14 16:00:00")
+win_start    <- as_date(study_start)               # same period as dates, for daily tables
+win_end      <- as_date(study_end)
+data_start   <- as.Date("2024-03-25")   # longer period for the wells and the water-balance model
+data_end     <- as.Date("2025-05-15")
+leafon_start <- as.Date("2024-05-20")              # leaf-on window (fixed dates)
+leafon_end   <- as.Date("2024-10-15")
+
+tr_floor    <- -0.49   # TR water-level sensor at ~0.50 m: values at or below are censored
+sap_max     <- 0.1     # sap flux at or above this value is a sensor error
+swc_min     <- 0.05    # SWC below this value is a sensor error
+ts_frozen   <- 0       # days with soil temperature at or below 0 C are excluded (frozen soil)
+min_obs_day <- 4       # minimum SWC measurements per port and day
+rain_min_mm <- 1       # rain-free day: less than 1 mm
+
+noaa_station <- "9063079"            # NOAA Marblehead, OH (Lake Erie level)
+site_lat     <- 41.378165
+site_lon     <- -82.508944
+
+# Helper functions (used for the rolling windows of the driver table)
+roll_mean_obs <- function(x, k, min_frac = 0.8) {
+  zoo::rollapplyr(x, k, function(v) {
+    if (length(v) < k || sum(!is.na(v)) < min_frac * k) NA_real_ else mean(v, na.rm = TRUE)
+  }, partial = TRUE, fill = NA)
+}
+roll_sum_obs <- function(x, k) {
+  zoo::rollapplyr(x, k, function(v) if (length(v) < k || anyNA(v)) NA_real_ else sum(v),
+                  partial = TRUE, fill = NA)
+}
+```
+
+# Flux from the raw multiplexer files (Flux_Root_exc_df.qmd)
+
+```{r flux-raw}
+# From Flux_Root_exc_df.qmd: combines the multiplexer CSVs, sets the time zone, removes
+# duplicates and applies the flux QA/QC, giving df_root_flux_2026.
+# rebuild_flux = FALSE (default): reads df_root_flux_2026.rds as before (fast).
+# rebuild_flux = TRUE: rebuilds it from the raw CSVs (needs the OneDrive folder) and
+# overwrites the .rds. The logic is the same as in Flux_Root_exc_df.qmd, with two changes
+# that do not alter the result: the CO2_DRY/R2 diagnostic now uses df_fluxroot2024b (it used
+# the table before deduplication, with a different row order), and duplicates are counted
+# per TIMESTAMP and PORT before removing them, to confirm that no two ports share a timestamp.
+rebuild_flux   <- FALSE
+directory_path <- "C:/Users/rbitten/OneDrive - University of Toledo/Documents/Multiplexer/OWC_root_exclusion/multiplexer_data"
+
+if (rebuild_flux) {
+  csv_files <- list.files(directory_path, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE)
+  message(length(csv_files), " multiplexer files")
+
+  data_list <- list(); error_files <- c(); headers <- NULL
+  for (file in csv_files) {
+    tryCatch({
+      if (file.info(file)$size > 0) {
+        data <- read_csv(file, col_names = FALSE, show_col_types = FALSE)
+        if (nrow(data) >= 3) {
+          if (is.null(headers)) headers <- as.vector(unlist(data[2, ]))   # header = 2nd line of the first file
+          data <- data[-(1:3), ]
+          colnames(data) <- headers
+          data_list[[length(data_list) + 1]] <- data
+        }
+      } else message("Empty file: ", file)
+    }, error = function(e) {
+      message("Error processing file: ", file, ": ", e$message)
+      error_files <<- c(error_files, file)
+    })
+  }
+  complete_data <- data.table::rbindlist(data_list, use.names = TRUE, fill = TRUE)
+  if (length(error_files) > 0) { message("Files with errors:"); print(error_files) }
+
+  data_combined <- complete_data[, 1:51, with = FALSE]   # removing empty columns
+  colnames(data_combined) <- trimws(colnames(data_combined))
+
+  df_fluxroot2024 <- data_combined %>%
+    mutate(across(c(3, 5:51), ~ na_if(as.numeric(.), -9999)),
+           TIMESTAMP = as.POSIXct(paste0(DATE, TIME), format = "%Y%m%d%H%M%S"),
+           datetime  = floor_date(TIMESTAMP, "hour"),
+           DATE = as.Date(DATE, format = "%Y%m%d"),
+           TIME = format(strptime(TIME, format = "%H%M%S"), "%H:%M:%S"),
+           Treat = ifelse(PORT %in% c("1", "2", "3", "4"), "Control",
+                          ifelse(PORT %in% c("5", "6", "7", "8"), "Root-free", PORT)),
+           Treat = as.factor(Treat))
+
+  # Logger clock = EST without daylight saving (UTC-5)
+  df_fluxroot2024b <- df_fluxroot2024 %>%
+    mutate(TIMESTAMP = force_tz(TIMESTAMP, tzone = "Etc/GMT+5"),
+           datetime  = floor_date(TIMESTAMP, unit = "hour"))
+
+  # Duplicates (same data saved in more than one file)
+  df_fluxroot2024b %>% count(TIMESTAMP, PORT) %>% filter(n > 1) %>% nrow() %>%
+    message(" TIMESTAMP x PORT combinations saved more than once")
+  df_fluxroot2024b %>% distinct(TIMESTAMP, PORT) %>% count(TIMESTAMP) %>% filter(n > 1) %>% nrow() %>%
+    message(" timestamps with more than one PORT (should be 0)")
+  df_fluxroot2024b <- df_fluxroot2024b %>%
+    arrange(TIMESTAMP) %>%
+    distinct(TIMESTAMP, .keep_all = TRUE)
+
+  # QA/QC diagnostics
+  num_obs_CO2_DRY <- sum(df_fluxroot2024b$CO2_DRY > 550, na.rm = TRUE)
+  num_obs_both    <- sum(df_fluxroot2024b$CO2_DRY > 550 & df_fluxroot2024b$FCO2_R2 > 0.8, na.rm = TRUE)
+  cat("Initial CO2 > 550:", round(100 * num_obs_CO2_DRY / sum(!is.na(df_fluxroot2024b$CO2_DRY)), 2), "% of obs;",
+      round(100 * num_obs_both / num_obs_CO2_DRY, 2), "% of those with FCO2 R2 > 0.8 (kept)\n")
+
+  mad_outlier <- function(x, ndev = 2.5) {
+    xmed <- median(x, na.rm = TRUE); xmad <- mad(x, na.rm = TRUE)
+    xout <- abs(x - xmed) / xmad > ndev
+    message("Median = ", signif(xmed, 4), ", MAD = ", signif(xmad, 4), ", outliers = ",
+            sum(xout, na.rm = TRUE), " of ", length(xout))
+    xout
+  }
+  df_root_clean <- df_fluxroot2024b %>%
+    mutate(FLAG_CO2_Outliers = mad_outlier(FCO2),
+           FLAG_CH4_Outliers = mad_outlier(FCH4)) %>%   # flagged only, not removed (bubbles / high fluxes)
+    filter(FCH4 != -9999,
+           FCO2 != -9999,
+           FCO2 > 0,
+           !(CO2_DRY > 550 & FCO2_R2 < 0.8),
+           FCO2_R2 > 0,
+           FCH4_R2 > 0)
+  df_root_clean$SWC_1[df_root_clean$SWC_1 == -9999] <- NA
+  df_root_clean$TS_1[df_root_clean$TS_1 == -9999]   <- NA
+  df_root_clean$SWC_1[df_root_clean$SWC_1 < 0.03]   <- 0.03   # below the detection limit
+
+  df_root_flux_2026 <- df_root_clean %>%
+    dplyr::select(DATE, TIME, DOY, PORT, Treat, FCH4, FCH4_R2, FCO2, FCO2_R2, SWC_1, TS_1, TIMESTAMP, datetime) %>%
+    filter(!is.na(FCH4)) %>%
+    mutate(Treat = as.factor(Treat),
+           season = case_when(
+             DATE >= as.Date("2024-03-20") & DATE < as.Date("2024-06-22") ~ "Spring",
+             DATE >= as.Date("2024-06-22") & DATE < as.Date("2024-09-24") ~ "Summer",
+             DATE >= as.Date("2024-09-24") & DATE < as.Date("2024-12-22") ~ "Fall",
+             DATE >= as.Date("2024-12-22") & DATE < as.Date("2025-03-20") ~ "Winter",
+             DATE >= as.Date("2025-03-20") & DATE < as.Date("2025-06-22") ~ "Spring",
+             DATE >= as.Date("2025-06-22") & DATE < as.Date("2025-09-24") ~ "Summer"))
+  saveRDS(df_root_flux_2026, dfile("df_root_flux_2026.rds", must_exist = FALSE))
+} else {
+  df_root_flux_2026 <- readRDS(dfile("df_root_flux_2026.rds"))
+}
+message("df_root_flux_2026: ", nrow(df_root_flux_2026), " measurements | time zone: ",
+        lubridate::tz(df_root_flux_2026$datetime))
+
+# QA/QC'd LI-COR fluxes per measurement (13 columns, ~160 000 rows): a few MB as Parquet,
+# so the repository keeps the flux data without the raw files.
+save_ds(df_root_flux_2026, "flux_licor_qc_port",
+        "LI-COR multiplexer fluxes after QA/QC, one row per chamber measurement: DATE, TIME, DOY, PORT, Treat, FCH4, FCH4_R2, FCO2, FCO2_R2, SWC_1, TS_1, TIMESTAMP, datetime (Etc/GMT+5), season. = df_root_flux_2026")
+```
+
+# Hourly weather, sap flux and flux per measurement
+
+```{r hourly}
+# From "Preparing df's". df_L1_root and df_sap_OWC were created and QA/QC'd in separate scripts.
+# df_L1_root$datetime must be in the same time zone as the flux (Etc/GMT+5) for the join.
+df_L1_root        <- readRDS(dfile("df_L1_root.rds"))
+if (!identical(lubridate::tz(df_L1_root$datetime), lubridate::tz(df_root_flux_2026$datetime)))
+  warning("Time zones differ: df_L1_root '", lubridate::tz(df_L1_root$datetime), "' vs flux '",
+          lubridate::tz(df_root_flux_2026$datetime), "'. The join is by instant; check that the clock hours match.")
+
+# Sap flux of the TR trees, hourly per sensor (df_sap_OWC: all synoptic sites after QA/QC).
+df_sap_OWC <- readRDS(dfile("df_sap_OWC.rds")) %>%
+  mutate(
+    TIMESTAMP = ymd_hms(TIMESTAMP),
+    F = replace(F, !is.finite(F), NA_real_),
+    datetime = floor_date(TIMESTAMP, "hour")
+  ) %>%
+  filter(
+    Plot == "TR",
+    TIMESTAMP > as.POSIXct("2024-03-25 00:00:00"),
+    TIMESTAMP < as.POSIXct("2025-05-15 00:00:00")
+  ) %>%
+  group_by(datetime, Site, Plot, Sensor_ID) %>%
+  summarise(
+    across(
+      where(is.numeric),
+      ~ if (all(!is.finite(.x))) {
+        NA_real_
+      } else {
+        mean(.x[is.finite(.x)])
+      }
+    ),
+    .groups = "drop"
+  )
+
+# Exclude unreliable sap flow:
+#   - winter months (sensors not maintained): Nov, Dec, Jan
+#   - bad data from 14 Oct 2024 until the end of that winter
+sap_bad_months <- c(11, 12, 1)
+sap_bad_start  <- as.POSIXct("2024-10-14 00:00:00", tz = lubridate::tz(df_sap_OWC$datetime))
+sap_bad_end    <- as.POSIXct("2025-06-01 00:00:00", tz = lubridate::tz(df_sap_OWC$datetime))
+
+sap_is_bad <- function(datetime) {
+  month(datetime) %in% sap_bad_months | (datetime >= sap_bad_start & datetime < sap_bad_end)
+}
+
+df_sap_OWC <- df_sap_OWC %>%
+  mutate(F = if_else(sap_is_bad(datetime), NA_real_, F))
+
+# Sap flux joined to the L1 weather/water-level table, then averaged over sensors per hour.
+df_L1_sap_vps_gw <- df_sap_OWC %>% left_join(df_L1_root, by = "datetime")
+
+df_L1_sap_vps_gw <- df_L1_sap_vps_gw %>%
+  mutate(gw_hour = 100 * gwl_median,              # transforming m to cm
+         DATE = as.Date(datetime, format = "%Y-%m-%d"),
+         DOY = yday(datetime))
+
+df_L1_datetime <- df_L1_sap_vps_gw %>%
+  select(-Sensor_ID) %>%
+  group_by(datetime) %>%
+  summarise(
+    across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+    across(where(~ !is.numeric(.x)), ~ first(.x)),
+    .groups = "drop"
+  )
+
+df_L1_filtered <- df_L1_datetime %>% dplyr::select(-c(DATE, DOY))
+
+df_flux_hour <- df_root_flux_2026 %>% left_join(df_L1_filtered, by = "datetime")
+
+L1_flux <- df_flux_hour %>% mutate(season = case_when(
+      DATE >= as.Date("2024-03-20") & DATE < as.Date("2024-06-22") ~ "Spring",
+      DATE >= as.Date("2024-06-22") & DATE < as.Date("2024-09-24") ~ "Summer",
+      DATE >= as.Date("2024-09-24") & DATE < as.Date("2024-12-22") ~ "Fall",
+      DATE >= as.Date("2024-12-22") & DATE < as.Date("2025-03-20") ~ "Winter",
+      DATE >= as.Date("2025-03-20") & DATE < as.Date("2025-06-22") ~ "Spring",
+      DATE >= as.Date("2025-06-22") & DATE < as.Date("2025-09-24") ~ "Summer"
+    ))
+
+# ---- Bad soil-temperature records in July (sensor failure, TS_1 <= 1) --------------
+ts_july_fail_check <- L1_flux %>%
+  filter(month(datetime) == 7, TS_1 <= 1) %>%
+  arrange(datetime) %>%
+  summarise(first_bad = min(datetime), last_bad = max(datetime), n = n())
+print(ts_july_fail_check)
+
+ts_july_fail_by_port <- L1_flux %>%
+  filter(month(datetime) == 7, TS_1 <= 1) %>%
+  group_by(PORT) %>%
+  summarise(first_bad = min(datetime), last_bad = max(datetime), n = n(), .groups = "drop") %>%
+  arrange(PORT)
+print(ts_july_fail_by_port)
+
+p_ts_raw_port <- ggplot(L1_flux, aes(x = datetime, y = TS_1)) +
+  geom_point(color = "black", alpha = 0.4, size = 0.8) +
+  geom_point(data = L1_flux %>% filter(TS_1 <= 1), color = "red", size = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  facet_wrap(~ PORT, ncol = 2) +
+  labs(x = "Datetime", y = "Soil Temp - TS_1 (°C, raw)",
+       title = "Raw soil temperature by PORT", subtitle = "Red = points with TS_1 <= 1") +
+  theme_bw()
+print(p_ts_raw_port)
+
+# Overall window (2024-07-11 10:00 to 2024-07-31 15:00) covers every port's failure.
+ts_fail_start <- ts_july_fail_check$first_bad
+ts_fail_end   <- ts_july_fail_check$last_bad
+
+L1_flux <- L1_flux %>%
+  mutate(
+    TS_1_flag = if_else(datetime >= ts_fail_start & datetime <= ts_fail_end & TS_1 <= 1,
+                        "sensor_failure_july", "ok"),
+    TS_1 = if_else(TS_1_flag == "sensor_failure_july", NA_real_, TS_1)
+  )
+
+stopifnot(nrow(filter(L1_flux, month(datetime) == 7, TS_1 <= 1)) == 0)   # cleaning worked
+
+# ---- Hourly summary per treatment (median, IQR, mean, SD over the 4 ports) ---------
+df_summary_hour <- L1_flux %>%
+  group_by(datetime, Treat, season) %>%
+  dplyr::summarise(mean_FCH4 = mean((FCH4), na.rm = TRUE),
+            sd_FCH4 = sd((FCH4), na.rm = TRUE),
+            median_FCH4 = median((FCH4), na.rm = TRUE),
+            IQR_FCH4 = IQR((FCH4), na.rm = TRUE),
+
+            mean_SWC = mean((SWC_1), na.rm = TRUE),
+            sd_SWC = sd((SWC_1), na.rm = TRUE),
+            median_SWC = median((SWC_1), na.rm = TRUE),
+            IQR_SWC = IQR((SWC_1), na.rm = TRUE),
+
+            mean_TS = mean((TS_1), na.rm = TRUE),
+            sd_TS = sd((TS_1), na.rm = TRUE),
+            median_TS = median((TS_1), na.rm = TRUE),
+            IQR_TS = IQR((TS_1), na.rm = TRUE),
+
+            mean_FCO2 = mean((FCO2), na.rm = TRUE),
+            sd_FCO2 = sd((FCO2), na.rm = TRUE),
+            median_FCO2 = median((FCO2), na.rm = TRUE),
+            IQR_FCO2 = IQR((FCO2), na.rm = TRUE),
+
+            mean_gwl = mean((gwl_median), na.rm = TRUE),
+            sd_gwl = sd((gwl_median), na.rm = TRUE),
+            median_gwl = median((gwl_median), na.rm = TRUE),
+            IQR_gwl = IQR((gwl_median), na.rm = TRUE),
+
+            mean_sap =  mean(F, na.rm = TRUE),
+            sd_sap =  sd(F, na.rm = TRUE),
+            median_sap =  median(F, na.rm = TRUE),
+            IQR_sap = IQR(F, na.rm = TRUE),
+
+            mean_vpd = mean((VPD_hour), na.rm = TRUE),
+            sd_vpd = sd((VPD_hour), na.rm = TRUE),
+            median_vpd = median((VPD_hour), na.rm = TRUE),
+            IQR_vpd = IQR((VPD_hour), na.rm = TRUE),
+            n_obs = n()) %>%
+  ungroup() %>%
+  left_join(df_L1_datetime %>% dplyr::select(datetime, rain_sum), by = "datetime")   # = df_gamm
+
+save_ds(L1_flux, "flux_measurements_port",
+        "Each chamber measurement (multiplexer cycle) of CH4/CO2 flux, SWC_1, TS_1 per port (8 ports) joined to hourly weather, TR water level and sensor-mean sap flux; TS_1 July failure set to NA (TS_1_flag); season. = L1_flux")
+save_ds(df_summary_hour, "flux_hourly_treatment",
+        "Hourly mean, SD, median, IQR per treatment of FCH4, SWC, TS, FCO2, gwl, sap F, VPD + rain_sum (hours with sap records). = df_summary_hour / df_gamm")
+save_ds(df_sap_OWC, "sap_hourly_sensor",
+        "TR sap flux density F (Granier) per sensor and hour, 2024-03-25 to 2025-05-15; Nov-Jan and 14 Oct 2024 - 31 May 2025 set to NA. = df_sap_OWC")
+save_ds(df_L1_root, "met_watertable_hourly",
+        "L1 hourly weather and TR water level (rain_sum, VPD_hour, gwl_median, ...), all hours (use for rain: it is not limited to hours with sap records). = df_L1_root")
+```
+
+# Manual measurements: redox and nutrients
+
+```{r manual}
+redox_df <- read.csv(dfile("Redox_root_OWC_2024_all.csv")) %>%
+  rename(Treat = Treatment) %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y"),
+         datetime = as.POSIXct(paste(Date, "00:00:00"), format = "%Y-%m-%d %H:%M:%S"),
+         depth_f = factor(depth_cm, levels = c(5, 10, 20)),
+         Treat = case_when(Treat == "CRT" ~ "Control",
+                           Treat == "REX" ~ "Root-free")) %>%
+  filter(!is.na(depth_cm),
+         datetime <= "2025-01-14 16:00:00 UTC" & datetime >= "2024-04-05 15:00:00 UTC")
+
+nut_clean <- read.csv(nut_file) %>%
+  mutate(
+    Treat = case_when(
+      str_detect(Sample.ID, "trC") ~ "Control",
+      str_detect(Sample.ID, "trE") ~ "Root-free",
+      TRUE ~ NA_character_),
+    Depth = case_when(
+      str_detect(Sample.ID, "10cm") ~ "10 cm",
+      str_detect(Sample.ID, "20cm") ~ "20 cm",
+      str_detect(Sample.ID, "40cm") ~ "40 cm",
+      TRUE ~ NA_character_)) %>%
+  filter(!is.na(Treat), !is.na(Depth))
+
+save_ds(redox_df, "redox_manual",
+        "Manual redox (mV) and pH by treatment, date and depth (5, 10, 20 cm), study period.")
+save_ds(nut_clean, "nutrients_soil",
+        "Soil nutrient results (AQ700) for the TR plots with Treat and Depth (10, 20, 40 cm); other samples removed.")
+```
+
+# CH4 gap filled per treatment (cumulative flux)
+
+```{r ch4-cumulative}
+# From "Prep df for CH4 cumulative flux". Per treatment, hourly, umol m-2 h-1.
+L1_fluxsummary <- df_summary_hour %>%
+  filter(datetime <= "2025-01-14 16:00:00" & datetime >= "2024-04-05 15:00:00",
+         median_FCH4 < 250 & median_FCH4 > -250) %>%   # removing outliers
+  mutate(median_FCH4 = median_FCH4 * 3600)             # second -> hour
+
+start_time <- as.POSIXct("2024-04-05 15:00:00")
+end_time   <- as.POSIXct("2025-04-05 14:00:00")
+all_hours  <- tibble(datetime = seq(from = start_time, to = end_time, by = "1 hour"))
+all_treat  <- tibble(Treat = c("Control", "Root-free"))
+full_grid  <- crossing(all_treat, all_hours)
+
+L1_flux_complete <- full_grid %>%
+  left_join(L1_fluxsummary, by = c("Treat", "datetime")) %>%
+  arrange(Treat, datetime) %>%
+  mutate(date = as.Date(datetime), month = month(datetime))
+
+# Linear interpolation of gaps < 24 h
+L1_flux_complete <- L1_flux_complete %>%
+  group_by(Treat) %>%
+  arrange(datetime) %>%
+  mutate(FCH4_linear = na.approx(median_FCH4, x = datetime, maxgap = 23, na.rm = FALSE)) %>%
+  ungroup()
+
+# Monthly median per treatment (February takes January if missing)
+monthly_median <- L1_flux_complete %>%
+  group_by(Treat, month) %>%
+  summarise(med_FCH4 = median(median_FCH4, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Treat) %>%
+  arrange(month) %>%
+  mutate(med_FCH4 = if_else(is.na(med_FCH4) & month == 2, med_FCH4[month == 1], med_FCH4)) %>%
+  ungroup()
+
+# Remaining gaps -> monthly median. gap_flag: 0 observed, 1 linear, 2 monthly median
+L1_flux_complete <- L1_flux_complete %>%
+  left_join(monthly_median, by = c("Treat", "month")) %>%
+  mutate(FCH4_GP = ifelse(is.na(FCH4_linear), med_FCH4, FCH4_linear),
+         gap_flag = case_when(
+           !is.na(median_FCH4) ~ 0,
+           is.na(median_FCH4) & !is.na(FCH4_linear) ~ 1,
+           is.na(median_FCH4) & is.na(FCH4_linear) ~ 2)) %>%
+  select(-FCH4_linear, -med_FCH4)
+
+L1_flux_cumulative <- L1_flux_complete %>%
+  mutate(Treat = factor(Treat)) %>%
+  arrange(Treat, datetime) %>%
+  group_by(Treat) %>%
+  arrange(datetime, .by_group = TRUE) %>%
+  mutate(FCH4_cum = cumsum(replace_na(FCH4_GP, 0))) %>%
+  ungroup()
+
+L1_flux_cumulative %>% count(Treat, gap_flag) %>% print()
+
+save_ds(L1_flux_cumulative, "ch4_gapfilled_cumulative_treatment",
+        "Hourly treatment-median CH4 (umol m-2 h-1) 2024-04-05 to 2025-04-05, gap filled (FCH4_GP; gap_flag 0 observed, 1 linear < 24 h, 2 monthly median) and cumulative (FCH4_cum). = L1_flux_cumulative")
+```
+
+# Daily weather, SWC and CH4
+
+```{r daily}
+# From "Setup df for analysis".
+# Daily weather from df_L1_root (one record per hour); incomplete days (< 20 h) -> NA.
+met_daily <- df_L1_root %>%
+  mutate(DATE = as_date(datetime)) %>%
+  group_by(DATE) %>%
+  summarise(rain    = sum(rain_sum, na.rm = TRUE),
+            n_hours = sum(!is.na(rain_sum)),
+            vpd_max = suppressWarnings(max(VPD_hour, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(rain    = if_else(n_hours >= 20, rain, NA_real_),
+         vpd_max = if_else(is.finite(vpd_max), vpd_max, NA_real_)) %>%
+  dplyr::select(-n_hours)
+
+met_daily %>%
+  filter(DATE >= win_start, DATE <= win_end) %>%
+  summarise(total_rain_mm = sum(rain, na.rm = TRUE), days_without_rain_data = sum(is.na(rain))) %>%
+  print()
+
+# Daily SWC per port: median of the day; drops sensor errors, days with few measurements
+# and frozen soil.
+swc_daily <- L1_flux %>%
+  filter(datetime >= study_start, datetime <= study_end) %>%
+  mutate(DATE  = as_date(datetime),
+         SWC_1 = if_else(SWC_1 < swc_min, NA_real_, SWC_1)) %>%
+  group_by(DATE, PORT, Treat) %>%
+  summarise(swc    = median(SWC_1, na.rm = TRUE),
+            ts_min = suppressWarnings(min(TS_1, na.rm = TRUE)),
+            n_obs  = sum(is.finite(SWC_1)), .groups = "drop") %>%
+  filter(n_obs >= min_obs_day, !is.finite(ts_min) | ts_min > ts_frozen) %>%
+  mutate(PORT  = factor(PORT),
+         Treat = factor(Treat, levels = c("Control", "Root-free")))
+
+# Daily CH4 per port: median flux and soil temperature, only on days with valid SWC.
+ch4_all <- L1_flux %>%
+  filter(datetime >= study_start, datetime <= study_end) %>%
+  mutate(DATE = as_date(datetime), PORT = factor(PORT)) %>%
+  group_by(DATE, PORT) %>%
+  summarise(fch4 = median(FCH4, na.rm = TRUE),
+            ts   = median(TS_1, na.rm = TRUE), .groups = "drop") %>%
+  inner_join(swc_daily %>% dplyr::select(DATE, PORT, Treat, swc), by = c("DATE", "PORT")) %>%
+  filter(!is.na(fch4), !is.na(ts))
+
+save_ds(met_daily, "met_daily",
+        "Daily rain (mm; NA if < 20 h recorded) and maximum VPD. = met_daily")
+save_ds(swc_daily, "swc_daily_port",
+        "Daily median SWC per port (SWC < 0.05 removed, >= 4 obs/day, no frozen days), min soil T, n obs. = swc_daily")
+save_ds(ch4_all, "ch4_daily_port",
+        "Daily median CH4 flux and soil T per port, on days with valid SWC (+ swc). = ch4_all")
+```
+
+# Drivers: Lake Erie, sap flux, MODIS GPP and stand transpiration
+
+```{r drivers}
+# Lake Erie level from NOAA, downloaded once and cached in data_dir.
+get_noaa_level <- function(station, start, end) {
+  months <- seq(floor_date(start, "month"), floor_date(end, "month"), by = "month")
+  purrr::map_dfr(months, function(m) {
+    url <- paste0("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?",
+                  "product=hourly_height&station=", station,
+                  "&begin_date=", format(m, "%Y%m%d"),
+                  "&end_date=", format(ceiling_date(m, "month") - days(1), "%Y%m%d"),
+                  "&datum=IGLD&units=metric&time_zone=lst&format=csv&application=OWC_root_exclusion")
+    out <- tryCatch(clean_names(read_csv(url, show_col_types = FALSE)), error = function(e) NULL)
+    if (is.null(out) || !"water_level" %in% names(out)) return(NULL)
+    tibble(datetime   = if (inherits(out$date_time, "POSIXct")) out$date_time else ymd_hm(out$date_time),
+           lake_level = as.numeric(out$water_level))
+  })
+}
+lake_file <- dfile("lake_level_hourly_2024_2025.rds", must_exist = FALSE)
+if (!file.exists(lake_file)) saveRDS(get_noaa_level(noaa_station, data_start - 40, data_end), lake_file)
+lake_hourly <- readRDS(lake_file)
+
+lake_d <- lake_hourly %>%
+  group_by(DATE = as_date(datetime)) %>%
+  summarise(lake = mean(lake_level, na.rm = TRUE), .groups = "drop") %>%
+  mutate(lake_change = lake - lag(lake))
+
+# Daily sap flux proxy: midday median (11-14 h) and daily integral, median across sensors.
+sap_d <- df_sap_OWC %>%
+  mutate(F = if_else(F >= sap_max, NA_real_, F),
+         DATE = as_date(datetime), hr = hour(datetime)) %>%
+  group_by(DATE, Sensor_ID) %>%
+  summarise(sap_mid = median(F[hr %in% 11:14], na.rm = TRUE),
+            sap_sum = sum(F, na.rm = TRUE) * 3600,
+            n_hours = sum(is.finite(F)), .groups = "drop") %>%
+  filter(n_hours >= 20, is.finite(sap_mid)) %>%
+  group_by(DATE) %>%
+  summarise(sap_mid = median(sap_mid), sap_sum = median(sap_sum), .groups = "drop")
+
+# MODIS GPP (MOD17A2HGF, 8-day composites, g C m-2 d-1), cached in data_dir.
+gpp_file     <- dfile("modis_gpp_OWC_8day_2024_2025.rds", must_exist = FALSE)
+gpp_file_old <- dfile("modis_gpp_OWC_2024_2025.rds", must_exist = FALSE)
+if (!file.exists(gpp_file) && file.exists(gpp_file_old)) {
+  readRDS(gpp_file_old) %>% mutate(DATE = DATE - 4) %>% saveRDS(gpp_file)
+}
+if (!file.exists(gpp_file)) {
+  mt_subset(product = "MOD17A2HGF", band = "Gpp_500m", lat = site_lat, lon = site_lon,
+            start = as.character(data_start - 40), end = as.character(data_end),
+            km_lr = 0, km_ab = 0, site_name = "OWC", internal = TRUE, progress = FALSE) %>%
+    transmute(DATE = as_date(calendar_date),
+              gpp  = if_else(value > 32760, NA_real_, value * 0.0001 * 1000 / 8)) %>%
+    saveRDS(gpp_file)
+}
+
+drivers_all <- tibble(DATE = seq(data_start - 40, data_end, by = "day")) %>%
+  left_join(met_daily, by = "DATE") %>%
+  left_join(lake_d, by = "DATE") %>%
+  left_join(sap_d, by = "DATE") %>%
+  left_join(readRDS(gpp_file), by = "DATE") %>%
+  tidyr::fill(gpp, .direction = "down") %>%
+  mutate(rain_7d   = roll_sum_obs(rain, 7),
+         rain_30d  = roll_sum_obs(rain, 30),
+         sap_cum30 = roll_mean_obs(sap_mid, 30),
+         gpp_cum30 = roll_mean_obs(gpp, 30))
+
+# ---- Stand transpiration (from "Standing transpiration") ---------------------------
+plot_area_m2 <- 625                    # TR inventory plot area (m2): confirm
+f_to_cm_s    <- 1                     # multiplier converting F to cm3 cm-2 s-1
+dead_codes   <- c("D", "DS", "DN")    # Status_2024 codes of dead trees (LI = live)
+
+ring_area_cm2 <- function(dbh_m, depth_mm) {
+  r <- dbh_m * 100 / 2
+  pi * (r^2 - pmax(r - depth_mm / 10, 0)^2)
+}
+
+cores_file <- dfile("bai_data_OWC.csv")
+header_row <- which(str_detect(tolower(readLines(cores_file, warn = FALSE)), "genus"))[1]
+if (is.na(header_row)) stop("No line containing 'genus' in ", cores_file)
+cores_raw <- read_csv(cores_file, skip = header_row - 1,
+                      col_types = cols(.default = col_character())) %>%
+  janitor::clean_names()
+needed_cols <- c("genus", "dbh_m_field", "sapwood_msmt_mm")
+if (!all(needed_cols %in% names(cores_raw)))
+  stop("Core file columns differ from the expected ones. Found: ", paste(names(cores_raw), collapse = ", "))
+cores <- cores_raw %>%
+  transmute(genus,
+            dbh_field_m = readr::parse_number(dbh_m_field),
+            sapwood_mm  = readr::parse_number(sapwood_msmt_mm)) %>%
+  filter(str_detect(genus, regex("^qu", ignore_case = TRUE)), !is.na(dbh_field_m), !is.na(sapwood_mm)) %>%
+  mutate(sapwood_cm2 = ring_area_cm2(dbh_field_m, sapwood_mm))
+oak_allom <- lm(log(sapwood_cm2) ~ log(dbh_field_m * 100), data = cores)
+message(nrow(cores), " oak cores used for the sapwood allometry")
+print(summary(oak_allom)$coefficients)
+
+inventory <- read_csv(dfile("LE_TreePlotInventory_OWC.csv"),
+                      col_types = cols(.default = col_character())) %>%
+  filter(Site == "OWC", Plot == "TR") %>%
+  transmute(tree_id = Tag, status = Status_2024,
+            dbh_m   = readr::parse_number(DBH_cm_2024) / 100) %>%
+  filter(!is.na(dbh_m), !status %in% dead_codes) %>%
+  mutate(sapwood_cm2 = exp(predict(oak_allom, newdata = data.frame(dbh_field_m = dbh_m))))
+
+as_ag_cm2_per_m2 <- sum(inventory$sapwood_cm2) / plot_area_m2
+message(nrow(inventory), " live trees | sapwood area per ground area: ", round(as_ag_cm2_per_m2, 1), " cm2 m-2",
+        if (as_ag_cm2_per_m2 > 60) " -> unusually high, check plot_area_m2" else "")
+
+js_daily <- df_sap_OWC %>%
+  filter(!is.na(F), F < sap_max) %>%
+  group_by(DATE = as_date(datetime), Sensor_ID) %>%
+  summarise(js = sum(F * f_to_cm_s) * 3600, n_hours = n(), .groups = "drop") %>%   # cm3 cm-2 d-1
+  filter(n_hours >= 20) %>%
+  group_by(DATE) %>%
+  summarise(js = median(js), n_sensors = n(), .groups = "drop")
+
+E_stand <- js_daily %>%
+  transmute(DATE, js_cm3_cm2_d = js, E_mm = js * as_ag_cm2_per_m2 / 1e4 * 10, n_sensors)
+
+E_stand %>%
+  filter(DATE >= leafon_start, DATE <= leafon_end) %>%
+  summarise(days_measured = n(), E_mean_mm_d = mean(E_mm),
+            E_p10 = quantile(E_mm, 0.1), E_p90 = quantile(E_mm, 0.9)) %>%
+  print()
+
+drivers_all <- drivers_all %>%
+  left_join(E_stand %>% dplyr::select(DATE, E_mm), by = "DATE") %>%
+  mutate(E_mean30 = roll_mean_obs(E_mm, 30))
+
+save_ds(lake_hourly, "lake_erie_level_hourly",
+        "Lake Erie hourly water level (m, IGLD), NOAA station 9063079 Marblehead; local standard time.")
+save_ds(drivers_all, "drivers_daily",
+        "Daily drivers from data_start - 40 d to data_end: rain, vpd_max, lake level and change, sap_mid/sap_sum, MODIS GPP, 7/30-d rain sums, 30-d means of sap, GPP and stand transpiration (E_mm, E_mean30). = drivers_all")
+save_ds(E_stand, "stand_transpiration_daily",
+        "TR stand transpiration E_mm (mm d-1) = median daily sap flux density (cm3 cm-2 d-1) x sapwood area per ground area; n_sensors. = E_stand")
+save_ds(inventory %>% mutate(plot_area_m2 = plot_area_m2), "trees_TR_sapwood",
+        "Live trees of the TR plot (2024 census) with DBH and sapwood area from the oak allometry.")
+save_ds(cores, "oak_cores_sapwood",
+        "Oak cores used for the sapwood allometry: DBH, sapwood depth and area.")
+```
+
+# Water level in TR, WTE and W
+
+```{r wells}
+files <- list.files(compass_dir, recursive = TRUE, full.names = TRUE,
+                    pattern = "^OWC_(TR|W|WTE)_(2024|2025)_(gw-pressure-vented|gw-density).*parquet$")
+message(length(files), " well files")
+if (length(files) == 0) stop("No well files in ", compass_dir, ": check compass_dir in 'Setup'")
+
+well_dimensions <- read_csv(dfile("well_dimensions.csv"), show_col_types = FALSE) %>%
+  transmute(Site = site,
+            Plot = case_when(transect_location == "Upland"     ~ "UP",
+                             transect_location == "Transition" ~ "TR",
+                             transect_location == "WTE"        ~ "WTE",
+                             transect_location == "Wetland"    ~ "W"),
+            ground_to_sensor_cm = ring_to_pressure_sensor_cm - (well_top_to_ground_cm - bolt_to_cap_cm))
+
+# Water level relative to the ground surface (negative = below ground).
+dat_L1_hour <- purrr::map_dfr(files, arrow::read_parquet) %>%
+  group_by(TIMESTAMP, Site, Plot, research_name) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = research_name, values_from = Value) %>%
+  left_join(well_dimensions, by = c("Site", "Plot")) %>%
+  mutate(density = if_else(`gw-density` > 0.95, `gw-density`, 1),
+         wl_below_surface_m = (`gw-pressure-vented` * 100) / (density * 1000 * 9.80665) -
+           ground_to_sensor_cm / 100) %>%
+  filter(as_date(TIMESTAMP) >= data_start, as_date(TIMESTAMP) < data_end) %>%
+  dplyr::select(TIMESTAMP, Plot, wl_below_surface_m)
+
+# Barrier beach open periods (OWC NERR daily log). When open, the estuary drains to the lake.
+barrier_open <- tibble::tribble(
+  ~start,       ~end,
+  "2024-04-01", "2024-04-25",
+  "2024-04-30", "2024-05-07",
+  "2024-05-18", "2024-05-26",
+  "2024-06-06", "2024-06-07",
+  "2024-07-08", "2024-07-09",
+  "2024-12-11", "2025-03-26",
+  "2025-03-28", "2025-04-30",
+  "2025-05-04", "2025-05-14") %>%
+  mutate(start = as.Date(start), end = as.Date(end))
+
+barrier_days <- barrier_open %>%
+  reframe(DATE = seq(start, end, by = "day"), .by = start) %>%
+  distinct(DATE) %>%
+  mutate(barrier = "open")
+
+# Daily mean water level per well (one column per well), every day present.
+wells_daily <- dat_L1_hour %>%
+  group_by(DATE = as_date(TIMESTAMP), Plot) %>%
+  summarise(wl = mean(wl_below_surface_m, na.rm = TRUE), .groups = "drop") %>%
+  mutate(wl = if_else(is.finite(wl), wl, NA_real_)) %>%
+  pivot_wider(names_from = Plot, values_from = wl) %>%
+  tidyr::complete(DATE = seq(data_start, data_end - 1, by = "day")) %>%
+  left_join(barrier_days, by = "DATE") %>%
+  mutate(barrier = factor(coalesce(barrier, "closed"), levels = c("open", "closed")))
+
+save_ds(dat_L1_hour, "wells_hourly",
+        "Hourly water level relative to the ground (m, negative = below) in the TR, WTE and W wells (COMPASS L2), data_start to data_end. = dat_L1_hour")
+save_ds(wells_daily, "wells_daily",
+        "Daily mean water level per well (columns TR, WTE, W; m) with barrier state (open/closed); every day present. = wells_daily")
+save_ds(barrier_open, "barrier_open_periods",
+        "Barrier beach open periods (start, end dates), OWC NERR daily log. In the analysis: xmin/xmax for figures = as.POSIXct(start), as.POSIXct(end) + 1 day.")
+```
+
+# TR water table gap filled (water-balance model)
+
+```{r tr-gapfill}
+# From "TR water-balance model for gap filling" and Fix 3 (ensemble with the censoring
+# inside the simulation). Same equations and seeds as in root_exc_graphs_full.qmd, so the
+# series are identical. The model itself (m_full) is refitted in the analysis file from
+# tr_waterbalance_daily (lm, deterministic); its coefficients are also saved here.
+#   dTR_t = a * rain_t - b * (TR_{t-1} - WTE_{t-1}) - c * ET_t + d
+et_proxy      <- "gpp"
+exchange_with <- "WTE"
+n_sims        <- 500
+res_block     <- 7
+n_redraw      <- 50     # residual redraws allowed on a censored day (Fix 3)
+set.seed(42)
+
+wb_daily <- wells_daily %>%
+  left_join(met_daily %>% dplyr::select(DATE, rain), by = "DATE") %>%
+  left_join(drivers_all %>% dplyr::select(DATE, sap_mid, gpp), by = "DATE") %>%
+  mutate(down      = .data[[exchange_with]],
+         et        = .data[[et_proxy]],
+         tr_obs    = !is.na(TR) & TR > tr_floor,
+         dTR       = TR - lag(TR),
+         grad_prev = lag(TR) - lag(down),
+         fit_ok    = tr_obs & lag(tr_obs))
+
+fit_df  <- wb_daily %>% filter(fit_ok, !is.na(rain), !is.na(grad_prev), !is.na(et))
+m_hydro <- lm(dTR ~ rain + grad_prev, data = fit_df)
+m_full  <- lm(dTR ~ rain + grad_prev + et, data = fit_df)
+cat("Fitting days:", nrow(fit_df), "|", format(min(fit_df$DATE)), "to", format(max(fit_df$DATE)), "\n")
+print(summary(m_full)$coefficients)
+
+simulate_tr <- function(df, cf, noise = rep(0, nrow(df))) {
+  a <- cf[["rain"]]; b <- -cf[["grad_prev"]]; d <- cf[["(Intercept)"]]
+  c_et <- if ("et" %in% names(cf)) -cf[["et"]] else 0
+  sim <- rep(NA_real_, nrow(df))
+  for (i in seq_len(nrow(df))) {
+    if (df$tr_obs[i]) { sim[i] <- df$TR[i]; next }
+    if (i == 1 || is.na(sim[i - 1])) next
+    if (anyNA(c(df$rain[i], df$down[i - 1]))) { sim[i] <- sim[i - 1]; next }
+    et_i <- if (is.na(df$et[i])) 0 else df$et[i]
+    sim[i] <- sim[i - 1] + a * df$rain[i] - b * (sim[i - 1] - df$down[i - 1]) - c_et * et_i + d + noise[i]
+  }
+  sim
+}
+block_noise <- function(res, n, block) {
+  starts <- sample(seq_len(length(res) - block + 1), ceiling(n / block), replace = TRUE)
+  unlist(lapply(starts, function(s) res[s:(s + block - 1)]))[seq_len(n)]
+}
+
+# (a) Original ensemble (cap at the sensor applied after the simulation): TR_best.
+cf_draws <- MASS::mvrnorm(n_sims, coef(m_full), vcov(m_full))
+ens <- vapply(seq_len(n_sims), function(k)
+  simulate_tr(wb_daily, cf_draws[k, ], noise = block_noise(residuals(m_full), nrow(wb_daily), res_block)),
+  numeric(nrow(wb_daily)))
+censored_days <- !is.na(wb_daily$TR) & !wb_daily$tr_obs
+p_above <- rowMeans(ens > tr_floor, na.rm = TRUE)
+ens[censored_days, ] <- pmin(ens[censored_days, ], tr_floor)
+q <- apply(ens, 1, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+
+# (b) Fix 3 ensemble: censoring inside the simulation (used by chain, rain thresholds, diel).
+simulate_tr_cens <- function(df, cf, noise = rep(0, nrow(df)), res = numeric(0)) {
+  a <- cf[["rain"]]; b <- -cf[["grad_prev"]]; d <- cf[["(Intercept)"]]
+  c_et <- if ("et" %in% names(cf)) -cf[["et"]] else 0
+  cens <- !is.na(df$TR) & !df$tr_obs
+  sim <- rep(NA_real_, nrow(df))
+  for (i in seq_len(nrow(df))) {
+    if (df$tr_obs[i]) { sim[i] <- df$TR[i]; next }
+    if (i == 1 || is.na(sim[i - 1])) next
+    if (anyNA(c(df$rain[i], df$down[i - 1]))) { sim[i] <- sim[i - 1]; next }
+    et_i <- if (is.na(df$et[i])) 0 else df$et[i]
+    base <- sim[i - 1] + a * df$rain[i] - b * (sim[i - 1] - df$down[i - 1]) - c_et * et_i + d
+    sim[i] <- base + noise[i]
+    if (cens[i] && sim[i] > tr_floor) {
+      alt <- base + sample(res, n_redraw, replace = TRUE)
+      ok <- alt[alt <= tr_floor]
+      sim[i] <- if (length(ok) > 0) ok[1] else tr_floor
+    }
+  }
+  sim
+}
+res_full <- residuals(m_full)
+set.seed(42)
+ens_c <- vapply(seq_len(n_sims), function(k)
+  simulate_tr_cens(wb_daily, cf_draws[k, ],
+                   noise = block_noise(res_full, nrow(wb_daily), res_block), res = res_full),
+  numeric(nrow(wb_daily)))
+q_new <- apply(ens_c, 1, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+
+# Gap-filled series with flags (from tr_filled) + the Fix 3 quantiles.
+rng <- function(x) range(x, na.rm = TRUE)
+tr_filled <- wb_daily %>%
+  dplyr::select(DATE, TR, tr_obs, rain, et, down) %>%
+  mutate(status   = case_when(tr_obs ~ "observed",
+                              !is.na(TR) ~ "censored (below sensor)",
+                              TRUE ~ "missing (sensor gap)"),
+         filled   = !tr_obs,
+         TR_best  = if_else(tr_obs, TR, q[2, ]),
+         TR_lwr   = if_else(tr_obs, TR, q[1, ]),
+         TR_upr   = if_else(tr_obs, TR, q[3, ]),
+         ci_width = TR_upr - TR_lwr,
+         capped   = status == "censored (below sensor)" & p_above > 0.5,
+         grad_sim = lag(TR_best) - lag(down),
+         out_of_range = filled & (grad_sim < rng(fit_df$grad_prev)[1] | grad_sim > rng(fit_df$grad_prev)[2] |
+                                  (!is.na(et) & (et < rng(fit_df$et)[1] | et > rng(fit_df$et)[2])) |
+                                  rain > rng(fit_df$rain)[2]),
+         TR_cens_med = q_new[2, ],     # Fix 3 (censored inside) median = tr_main$TR_full
+         TR_cens_lwr = q_new[1, ],
+         TR_cens_upr = q_new[3, ]) %>%
+  group_by(obs_grp = cumsum(tr_obs)) %>%
+  mutate(days_since_obs = if_else(obs_grp == 0, NA_real_, as.numeric(row_number() - 1))) %>%
+  ungroup() %>%
+  dplyr::select(-obs_grp, -grad_sim)
+
+tr_filled %>%
+  filter(DATE >= win_start, DATE <= win_end) %>%
+  group_by(month = floor_date(DATE, "month")) %>%
+  summarise(pct_filled = round(100 * mean(filled)),
+            TR_best_median = round(median(TR_best, na.rm = TRUE), 2),
+            TR_cens_median = round(median(TR_cens_med, na.rm = TRUE), 2), .groups = "drop") %>%
+  print(n = Inf)
+
+# Ensemble members, wide: DATE + sim_001 ... sim_500 (= gwl_ens$values).
+ens_tbl <- as_tibble(ens_c, .name_repair = ~ sprintf("sim_%03d", seq_along(.x))) %>%
+  mutate(DATE = wb_daily$DATE, .before = 1)
+
+coef_tbl <- tibble(term = names(coef(m_full)), estimate = unname(coef(m_full)),
+                   se = sqrt(diag(vcov(m_full))), n_fit_days = nrow(fit_df))
+
+save_ds(wb_daily, "tr_waterbalance_daily",
+        "Daily table of the TR water-balance model: wells (TR, WTE, W, barrier), rain, sap_mid, gpp, down (= WTE), et (= gpp), tr_obs, dTR, grad_prev, fit_ok. = wb_daily (refit m_full: lm(dTR ~ rain + grad_prev + et) on fit_ok days with complete rain, grad_prev, et)")
+save_ds(tr_filled, "tr_watertable_gapfilled_daily",
+        "TR water table gap filled: status, TR_best/TR_lwr/TR_upr (original ensemble, 95%), flags capped/out_of_range/days_since_obs, TR_cens_med/lwr/upr (Fix 3 ensemble, censoring inside). = tr_filled + q_new")
+save_ds(ens_tbl, "tr_watertable_ensemble_censored",
+        "500 members of the Fix 3 gap-fill ensemble (censoring inside), wide: DATE + sim_001..sim_500 (m). = gwl_ens / ens_c")
+save_ds(coef_tbl, "tr_waterbalance_coefs",
+        "Coefficients of the TR water-balance model m_full (dTR ~ rain + grad_prev + et): estimate, SE, number of fitting days.")
+```
+
+# Parameters, data dictionary and format comparison
+
+```{r dictionary}
+params <- tibble::tribble(
+  ~name,          ~value,                       ~description,
+  "study_start",  format(study_start),          "first flux hour",
+  "study_end",    format(study_end),            "last flux hour",
+  "data_start",   format(data_start),           "start of wells / water-balance period",
+  "data_end",     format(data_end),             "end of wells / water-balance period (exclusive)",
+  "leafon_start", format(leafon_start),         "leaf-on window start",
+  "leafon_end",   format(leafon_end),           "leaf-on window end",
+  "tr_floor",     as.character(tr_floor),       "TR sensor floor (m); at or below = censored",
+  "sap_max",      as.character(sap_max),        "sap flux >= this is a sensor error",
+  "swc_min",      as.character(swc_min),        "SWC < this is a sensor error",
+  "ts_frozen",    as.character(ts_frozen),      "days with min soil T <= this are excluded",
+  "min_obs_day",  as.character(min_obs_day),    "min SWC obs per port and day",
+  "rain_min_mm",  as.character(rain_min_mm),    "rain-free day threshold (mm)",
+  "plot_area_m2", as.character(plot_area_m2),   "TR inventory plot area (m2)",
+  "as_ag_cm2_m2", as.character(as_ag_cm2_per_m2), "sapwood area per ground area (cm2 m-2)",
+  "sy",           as.character(0.001 / coef(m_full)[["rain"]]), "specific yield from m_full (0.001 / rain coef)",
+  "tz_flux",      lubridate::tz(L1_flux$datetime), "time zone of the hourly flux datetime")
+save_ds(params, "study_parameters", "Periods, thresholds and site constants used to build the datasets (text; convert with as.Date/as.POSIXct/as.numeric).")
+
+dictionary <- bind_rows(ds_log)
+readr::write_csv(dictionary, file.path(out_dir, "data_dictionary.csv"))
+
+# Size comparison: Parquet (kept) vs CSV (temporary). GitHub warns above 50 MB per file
+# and refuses above 100 MB.
+dictionary %>%
+  dplyr::select(file, n_rows, n_cols, parquet_kb, csv_kb) %>%
+  mutate(csv_over_parquet = round(csv_kb / parquet_kb, 1)) %>%
+  bind_rows(summarise(., file = "TOTAL", n_rows = NA, n_cols = NA,
+                      parquet_kb = sum(parquet_kb), csv_kb = sum(csv_kb),
+                      csv_over_parquet = round(sum(csv_kb) / sum(parquet_kb), 1))) %>%
+  print(n = Inf, width = Inf)
+```

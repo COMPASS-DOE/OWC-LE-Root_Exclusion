@@ -1,0 +1,1196 @@
+---
+title: "Roots and CH4 uptake in a riparian forest (OWC root exclusion): paper analyses"
+author: "Roberta Peixoto"
+date: today
+format:
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+Central question: **how do roots regulate CH4 uptake in a riparian forest soil?**
+Each section is one question and states the paper figure or table it produces.
+Inputs are only the processed tables of this repository (`data/*/processing_outputs`),
+plus redox and nutrient CSVs copied into `data/`. Study window: 2024-04-05 15:00 to
+2025-01-14 16:00 (Etc/GMT+5). Figures are saved in `analysis/figures/`.
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+require(pacman)
+p_load(tidyverse, lubridate, arrow, here, patchwork, ggpubr, zoo, sf, maps,
+       lme4, lmerTest, MuMIn, broom.mixed, sjPlot, nlme, janitor)
+theme_set(theme_bw())
+
+# Time zone of all processed tables (logger clocks, EST without daylight saving)
+tz_l <- "Etc/GMT+5"
+
+# Study window (first and last flux measurement) and leaf-on window
+study_start  <- as.POSIXct("2024-04-05 15:00:00", tz = tz_l)
+study_end    <- as.POSIXct("2025-01-14 16:00:00", tz = tz_l)
+win_start    <- as_date(study_start)
+win_end      <- as_date(study_end)
+leafon_start <- as.Date("2024-05-20")
+leafon_end   <- as.Date("2024-10-15")
+
+# Plot settings
+x_min <- study_start
+x_max <- study_end
+season_division_dates <- as.POSIXct(c("2024-03-20", "2024-06-22", "2024-09-24", "2024-12-22",
+                                      "2025-03-20"), tz = tz_l)
+treatment_colors <- c("Control" = "#7AD151FF", "Root-free" = "#440154FF")
+
+# Data-quality thresholds
+tr_floor    <- -0.49   # TR water-level sensor at ~0.50 m: values at or below are censored
+sap_max     <- 0.1     # sap flux at or above this value is a sensor error
+swc_min     <- 0.05    # SWC below this value is a sensor error
+ts_frozen   <- 0       # days with soil temperature at or below 0 C are excluded (frozen soil)
+min_obs_day <- 4       # minimum SWC measurements per port and day
+rain_min_mm <- 1       # rain-free day: less than 1 mm
+block_days  <- 14      # block length (days) of the block bootstrap
+
+fig_dir <- here::here("analysis", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Mean of the last k days, using measured days only (NA when < min_frac of the k days have data).
+roll_mean_obs <- function(x, k, min_frac = 0.8) {
+  zoo::rollapplyr(x, k, function(v) {
+    if (length(v) < k || sum(!is.na(v)) < min_frac * k) NA_real_ else mean(v, na.rm = TRUE)
+  }, partial = TRUE, fill = NA)
+}
+# Sum of the last k days; NA unless every day in the window was measured.
+roll_sum_obs <- function(x, k) {
+  zoo::rollapplyr(x, k, function(v) if (length(v) < k || anyNA(v)) NA_real_ else sum(v),
+                  partial = TRUE, fill = NA)
+}
+# Standardize to mean 0 and SD 1 (constant or empty vectors return NA).
+z <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - mean(x, na.rm = TRUE)) / s
+}
+# All 70 ways of calling 4 of the 8 ports "Control" (port randomization tests)
+port_assignments <- combn(8, 4, simplify = FALSE)
+```
+
+# Data
+
+```{r}
+#| label: read-data
+# ---- Chamber fluxes (one row per measurement; processing_flux.R) ----
+# Outlier flags (FLAG_CH4_Outliers, FLAG_CO2_Outliers) are kept, not removed, as before.
+# Treatment is taken from Design/port_treatment.csv by port number (not from the Treat column
+# of the parquet), so the labels are always exactly "Control" and "Root-free".
+port_treatment <- read_csv(here::here("Design", "port_treatment.csv"), show_col_types = FALSE) %>%
+  transmute(port_num = as.integer(PORT),
+            Treat_design = case_when(Treat %in% c("CTR", "CRT", "Control") ~ "Control",
+                                     Treat %in% c("REX", "Root-free") ~ "Root-free"))
+flux <- read_parquet(here::here("data", "soil_flux_licor", "processing_outputs",
+                                "flux_licor_qc_port.parquet")) %>%
+  mutate(port_num = as.integer(as.character(PORT))) %>%
+  left_join(port_treatment, by = "port_num") %>%
+  mutate(datetime = with_tz(datetime, tz_l),
+         PORT  = factor(port_num, levels = 1:8),
+         Treat = factor(Treat_design, levels = c("Control", "Root-free"))) %>%
+  dplyr::select(-port_num, -Treat_design) %>%
+  filter(datetime >= study_start, datetime <= study_end)
+if (anyNA(flux$Treat)) warning("Ports without treatment: ", paste(unique(flux$PORT[is.na(flux$Treat)]), collapse = ", "))
+print(count(flux, PORT, Treat))
+
+# ---- Weather (hourly; processing_L2_sensors.R): rain_sum, VPD_hour, tair, ... ----
+wx <- read_parquet(here::here("data", "L2_sensors", "processing_outputs", "wx_hourly.parquet")) %>%
+  mutate(datetime = with_tz(datetime, tz_l))
+
+# ---- Wells (hourly; gwl_median = m relative to the ground, negative = below) ----
+# TR = forest well under the plots; W = estuary/wetland well (external hydrology).
+gw <- read_parquet(here::here("data", "L2_sensors", "processing_outputs", "gw_hourly.parquet")) %>%
+  mutate(datetime = with_tz(datetime, tz_l))
+gw_tr <- gw %>% filter(Plot == "TR") %>% dplyr::select(datetime, gwl = gwl_median)
+
+# ---- Sap flux of the TR oaks (hourly per sensor; processing_sapflow.R, dTmax_final) ----
+# Only TR is used in the paper. F = Granier sap flux density (cm3 cm-2 s-1).
+sap <- read_parquet(here::here("data", "sap_flow", "processing_outputs",
+                               "sapflow_hourly_sensor.parquet")) %>%
+  filter(Plot == "TR") %>%
+  mutate(datetime = with_tz(datetime, tz_l),
+         F = if_else(is.finite(F) & F < sap_max, F, NA_real_))
+sap_hour <- sap %>%                         # mean of the sensors per hour
+  group_by(datetime) %>%
+  summarise(F = if (all(is.na(F))) NA_real_ else mean(F, na.rm = TRUE), .groups = "drop")
+
+# ---- MODIS GPP (8-day composites; processing_external.R) ----
+gpp_8d <- read_csv(here::here("data", "MODIS_NOAA", "processing_outputs", "modis_gpp_8day.csv"),
+                   show_col_types = FALSE)
+
+# ---- Redox (manual, copied into data/redox/) ----
+redox_df <- read.csv(here::here("data", "redox", "Redox_root_OWC_2024_all.csv")) %>%
+  rename(Treat = Treatment) %>%
+  mutate(Date     = as.Date(Date, format = "%m/%d/%Y"),
+         datetime = as.POSIXct(paste(Date, "00:00:00"), tz = tz_l),
+         depth_f  = factor(depth_cm, levels = c(5, 10, 20)),
+         Treat    = case_when(Treat %in% c("CRT", "CTR") ~ "Control", Treat == "REX" ~ "Root-free")) %>%
+  filter(!is.na(depth_cm), datetime >= study_start, datetime <= study_end)
+
+# ---- Nutrients (copied into data/nutrients/) ----
+nut <- read.csv(here::here("data", "nutrients", "nutrient_combined.csv"))   # columns Sample.ID, Test, Results
+
+# ---- Quick check of coverage in the study window ----
+tibble(table = c("flux", "wx", "TR well", "sap TR"),
+       first = c(min(flux$datetime), min(wx$datetime[wx$datetime >= study_start]),
+                 min(gw_tr$datetime[gw_tr$datetime >= study_start]), min(sap_hour$datetime[!is.na(sap_hour$F) & sap_hour$datetime >= study_start])),
+       last  = c(max(flux$datetime), max(wx$datetime[wx$datetime <= study_end]),
+                 max(gw_tr$datetime[gw_tr$datetime <= study_end]), max(sap_hour$datetime[!is.na(sap_hour$F) & sap_hour$datetime <= study_end]))) %>%
+  print()
+```
+
+```{r}
+#| label: build-tables
+# ---- Hourly treatment table (median and IQR of the 4 ports) for Figs 2, 3, 5, 6 ----
+flux_hour_trt <- flux %>%
+  group_by(datetime, Treat, season) %>%
+  summarise(median_FCH4 = median(FCH4, na.rm = TRUE),  IQR_FCH4 = IQR(FCH4, na.rm = TRUE),
+            median_FCO2 = median(FCO2, na.rm = TRUE),  IQR_FCO2 = IQR(FCO2, na.rm = TRUE),
+            median_SWC  = median(SWC_1, na.rm = TRUE), IQR_SWC  = IQR(SWC_1, na.rm = TRUE),
+            median_TS   = median(TS_1, na.rm = TRUE),  IQR_TS   = IQR(TS_1, na.rm = TRUE),
+            n_obs = n(), .groups = "drop") %>%
+  mutate(across(starts_with(c("median_", "IQR_")), ~ if_else(is.finite(.x), .x, NA_real_)))
+
+# ---- Daily weather ----
+met_daily <- wx %>%
+  group_by(DATE = as_date(datetime)) %>%
+  summarise(rain    = sum(rain_sum, na.rm = TRUE),
+            n_hours = sum(!is.na(rain_sum)),
+            vpd_med = median(VPD_hour, na.rm = TRUE),
+            vpd_max = suppressWarnings(max(VPD_hour, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(rain    = if_else(n_hours >= 20, rain, NA_real_),          # incomplete days -> NA
+         across(c(vpd_med, vpd_max), ~ if_else(is.finite(.x), .x, NA_real_))) %>%
+  dplyr::select(-n_hours)
+
+# ---- Daily wells: TR level, censored TR (capped at the sensor), estuary well W ----
+wells_daily <- gw %>%
+  filter(Plot %in% c("TR", "W")) %>%
+  group_by(DATE = as_date(datetime), Plot) %>%
+  summarise(wl = mean(gwl_median, na.rm = TRUE), .groups = "drop") %>%
+  mutate(wl = if_else(is.finite(wl), wl, NA_real_)) %>%
+  pivot_wider(names_from = Plot, values_from = wl) %>%
+  mutate(tr_obs   = !is.na(TR) & TR > tr_floor,       # TR above its sensor = real measurement
+         gwl_cens = pmax(TR, tr_floor))
+
+# ---- Daily sap flux (TR): midday median per sensor, then median across sensors ----
+sap_d <- sap %>%
+  mutate(DATE = as_date(datetime), hr = hour(datetime)) %>%
+  group_by(DATE, Sensor_ID) %>%
+  summarise(sap_mid = median(F[hr %in% 11:14], na.rm = TRUE),
+            n_hours = sum(is.finite(F)), .groups = "drop") %>%
+  filter(n_hours >= 20, is.finite(sap_mid)) %>%
+  group_by(DATE) %>%
+  summarise(sap_mid = median(sap_mid), .groups = "drop")
+
+# ---- Daily driver table. Starts 40 days early so the 30-day windows are complete. ----
+# GPP: each day takes the value of its 8-day composite (no interpolation).
+drivers_all <- tibble(DATE = seq(win_start - 40, win_end, by = "day")) %>%
+  left_join(met_daily, by = "DATE") %>%
+  left_join(wells_daily, by = "DATE") %>%
+  left_join(sap_d, by = "DATE") %>%
+  left_join(gpp_8d %>% dplyr::select(DATE, gpp), by = "DATE") %>%
+  tidyr::fill(gpp, .direction = "down") %>%
+  mutate(rain_7d   = roll_sum_obs(rain, 7),
+         rain_30d  = roll_sum_obs(rain, 30),
+         sap_cum30 = roll_mean_obs(sap_mid, 30),
+         gpp_cum30 = roll_mean_obs(gpp, 30))
+
+# ---- Daily SWC per port (median; drops sensor errors, days with few readings, frozen soil) ----
+swc_daily <- flux %>%
+  mutate(DATE = as_date(datetime), SWC_1 = if_else(SWC_1 < swc_min, NA_real_, SWC_1)) %>%
+  group_by(DATE, PORT, Treat) %>%
+  summarise(swc    = median(SWC_1, na.rm = TRUE),
+            ts_min = suppressWarnings(min(TS_1, na.rm = TRUE)),
+            n_obs  = sum(is.finite(SWC_1)), .groups = "drop") %>%
+  filter(n_obs >= min_obs_day, !is.finite(ts_min) | ts_min > ts_frozen)
+
+# ---- Daily CH4 per port (median flux and soil temperature, on days with valid SWC) ----
+ch4_all <- flux %>%
+  group_by(DATE = as_date(datetime), PORT) %>%
+  summarise(fch4 = median(FCH4, na.rm = TRUE),
+            ts   = median(TS_1, na.rm = TRUE), .groups = "drop") %>%
+  inner_join(swc_daily %>% dplyr::select(DATE, PORT, Treat, swc), by = c("DATE", "PORT")) %>%
+  filter(is.finite(fch4), is.finite(ts))
+
+# ---- Daily treatment table (median of the ports) joined to the drivers ----
+resp_daily <- swc_daily %>%
+  group_by(DATE, Treat) %>%
+  summarise(swc = median(swc), .groups = "drop") %>%
+  full_join(ch4_all %>% group_by(DATE, Treat) %>%
+              summarise(fch4 = median(fch4), ts = median(ts), .groups = "drop"),
+            by = c("DATE", "Treat")) %>%
+  left_join(drivers_all, by = "DATE") %>%
+  filter(DATE >= win_start, DATE <= win_end)
+```
+
+```{r}
+#| label: stand-transpiration
+# Stand transpiration of the TR plot (mm d-1) = sap flux density x sapwood area per ground area.
+# Used in Fig. S3 (30-day mean). Assumptions for Methods:
+#   - all trees in the TR plot treated as oaks (inventory has no species);
+#   - F in cm3 cm-2 s-1 (Granier); no radial / probe-in-heartwood correction, so E is a lower bound.
+plot_area_m2 <- 625                    # TR inventory plot area (m2): confirm
+dead_codes   <- c("D", "DS", "DN")    # Status_2024 codes of dead trees
+
+# Oak sapwood allometry from the cores: sapwood = outer ring pi * (r^2 - (r - s)^2)
+ring_area_cm2 <- function(dbh_m, depth_mm) {
+  r <- dbh_m * 100 / 2
+  pi * (r^2 - pmax(r - depth_mm / 10, 0)^2)
+}
+cores_file <- here::here("data", "sap_flow", "bai_data_OWC.csv")
+header_row <- which(str_detect(tolower(readLines(cores_file, warn = FALSE)), "genus"))[1]
+cores <- read_csv(cores_file, skip = header_row - 1, show_col_types = FALSE) %>%
+  janitor::clean_names() %>%
+  transmute(genus,
+            dbh_field_m = readr::parse_number(as.character(dbh_m_field)),
+            sapwood_mm  = readr::parse_number(as.character(sapwood_msmt_mm))) %>%
+  filter(str_detect(genus, regex("^qu", ignore_case = TRUE)), !is.na(dbh_field_m), !is.na(sapwood_mm)) %>%
+  mutate(sapwood_cm2 = ring_area_cm2(dbh_field_m, sapwood_mm))
+oak_allom <- lm(log(sapwood_cm2) ~ log(dbh_field_m * 100), data = cores)
+
+inventory <- read_csv(here::here("data", "sap_flow", "LE_TreePlotInventory_OWC.csv"),
+                      col_types = cols(.default = col_character())) %>%
+  filter(Site == "OWC", Plot == "TR") %>%
+  transmute(tree_id = Tag, status = Status_2024, dbh_m = readr::parse_number(DBH_cm_2024) / 100) %>%
+  filter(!is.na(dbh_m), !status %in% dead_codes) %>%
+  mutate(sapwood_cm2 = exp(predict(oak_allom, newdata = data.frame(dbh_field_m = dbh_m))))
+as_ag_cm2_per_m2 <- sum(inventory$sapwood_cm2) / plot_area_m2
+message(nrow(cores), " oak cores | ", nrow(inventory), " live trees | sapwood/ground area ",
+        round(as_ag_cm2_per_m2, 1), " cm2 m-2 (forests ~5-40)")
+
+# Daily sap flux density per sensor (complete days, >= 20 h), median across sensors, then E.
+E_stand <- sap %>%
+  filter(!is.na(F)) %>%
+  group_by(DATE = as_date(datetime), Sensor_ID) %>%
+  summarise(js = sum(F) * 3600, n_hours = n(), .groups = "drop") %>%      # cm3 cm-2 d-1
+  filter(n_hours >= 20) %>%
+  group_by(DATE) %>%
+  summarise(js = median(js), .groups = "drop") %>%
+  transmute(DATE, E_mm = js * as_ag_cm2_per_m2 / 1e4 * 10)                 # 1 cm3 cm-2 = 10 mm
+
+E_stand %>% filter(DATE >= leafon_start, DATE <= leafon_end) %>%
+  summarise(days = n(), E_mean_mm_d = mean(E_mm), E_p10 = quantile(E_mm, 0.1),
+            E_p90 = quantile(E_mm, 0.9)) %>% print()
+
+drivers_all <- drivers_all %>%
+  left_join(E_stand, by = "DATE") %>%
+  mutate(E_mean30 = roll_mean_obs(E_mm, 30))
+resp_daily <- resp_daily %>% left_join(drivers_all %>% dplyr::select(DATE, E_mm, E_mean30), by = "DATE")
+```
+
+# Where was the study done? (Fig. 1)
+
+```{r}
+#| label: fig1-map
+# Output: Fig. 1 (map of the site)
+sf::sf_use_s2(FALSE)
+usa_map <- st_as_sf(maps::map("state", plot = FALSE, fill = TRUE), crs = 4326)
+owc <- st_as_sf(data.frame(lon = -82.50894426204299, lat = 41.378165086166256),
+                coords = c("lon", "lat"), crs = 4326)
+
+p_usa_owc <- ggplot() +
+  geom_sf(data = usa_map, fill = "gray75", color = "white") +
+  geom_sf(data = owc, shape = 15, size = 4, color = "black") +
+  geom_sf_text(data = owc, label = "OWC", nudge_x = 0.01, nudge_y = -1.5, size = 4, fontface = "bold") +
+  coord_sf(xlim = c(-130, -65), ylim = c(24, 50)) +
+  theme(plot.title = element_blank(), axis.title = element_blank())
+print(p_usa_owc)
+ggsave(file.path(fig_dir, "Fig1_map.png"), p_usa_owc, width = 8, height = 5, dpi = 300, bg = "white")
+```
+
+# How did CH4, CO2, soil moisture, sap flow, water table, redox and rain vary over the study? (Fig. 2)
+
+```{r}
+#| label: fig2-timeseries
+#| fig-height: 22
+#| fig-width: 16
+# Output: Fig. 2 (hourly medians per treatment, ribbons = IQR across the 4 ports)
+ts_theme <- theme(legend.position = "none", panel.grid = element_blank(),
+                  text = element_text(size = 20), axis.text.x = element_blank())
+x_scale  <- scale_x_datetime(limits = c(x_min, x_max), breaks = seq(x_min, x_max, by = "20 days"))
+season_lines <- geom_vline(xintercept = season_division_dates, linetype = "dashed",
+                           color = "darkgray", linewidth = 0.5)
+
+trt_panel <- function(var, iqr, ylab, hline = NULL) {
+  g <- ggplot(flux_hour_trt, aes(datetime, .data[[var]], color = Treat)) +
+    geom_point(position = position_dodge(width = 0.5)) +
+    geom_ribbon(aes(ymin = .data[[var]] - .data[[iqr]], ymax = .data[[var]] + .data[[iqr]], fill = Treat),
+                alpha = 0.2, linetype = "blank") +
+    season_lines +
+    scale_color_manual(values = treatment_colors) + scale_fill_manual(values = treatment_colors) +
+    labs(x = NULL, y = ylab, color = "Treatment", fill = "Treatment") + x_scale + ts_theme
+  if (!is.null(hline)) g <- g + geom_hline(yintercept = hline, linetype = "dashed", color = "darkgray")
+  g
+}
+
+plot_FCH4 <- trt_panel("median_FCH4", "IQR_FCH4", bquote(atop("CH"[4] ~ "flux", ~ nmol ~ m^{-2} ~ s^{-1})), 0) +
+  coord_cartesian(ylim = c(-5, 15)) +
+  annotate("text", x = as.POSIXct(c("2024-04-25", "2024-08-10", "2024-10-25", "2025-01-05"), tz = tz_l),
+           y = 13, label = c("Spring", "Summer", "Fall", "Winter"), size = 8)
+
+plot_FCO2 <- trt_panel("median_FCO2", "IQR_FCO2", bquote(atop("CO"[2] ~ "flux", ~ mu*mol ~ m^{-2} ~ s^{-1})), 0) +
+  coord_cartesian(ylim = c(-1, 60))
+
+plot_SWC <- trt_panel("median_SWC", "IQR_SWC", bquote(atop("Soil moisture", ~ m^3 ~ m^{-3})), 0.4) +
+  coord_cartesian(ylim = c(0.1, 0.8)) +
+  theme(legend.position = c(0.1, 0.3))
+
+# Sap flux: midday (11-14 h) median of the sensors, IQR across sensors
+sap_midday <- sap %>%
+  filter(hour(datetime) %in% 11:14, datetime >= study_start, datetime <= study_end) %>%
+  group_by(datetime) %>%
+  summarise(median_F = median(F, na.rm = TRUE), IQR_F = IQR(F, na.rm = TRUE), .groups = "drop") %>%
+  filter(is.finite(median_F))
+plot_sap <- ggplot(sap_midday, aes(datetime, median_F)) +
+  geom_ribbon(aes(ymin = median_F - IQR_F, ymax = median_F + IQR_F), fill = "#7AD151FF", alpha = 0.2) +
+  geom_point(color = "#7AD151FF", size = 1.5) +
+  geom_smooth(method = "gam", formula = y ~ s(x, k = 10), color = "#7AD151FF", fill = "#7AD151FF") +
+  season_lines + x_scale +
+  labs(x = NULL, y = bquote(atop("Sap flux", ~ cm^3 ~ cm^{-2} ~ s^{-1}))) + ts_theme
+
+# TR water table (cm; values at -49 cm are the sensor floor = at or below)
+plot_gwl <- gw_tr %>% filter(datetime >= study_start, datetime <= study_end) %>%
+  ggplot(aes(datetime, gwl * 100)) +
+  geom_point(size = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray") +
+  season_lines + x_scale + scale_y_continuous(limits = c(-50, 25)) +
+  labs(x = NULL, y = "GW level\n cm") + ts_theme
+
+plot_redox <- ggplot(redox_df, aes(datetime, redox_mV + 200, color = Treat, fill = Treat)) +
+  geom_point(aes(shape = depth_f), position = position_dodge(width = 0.5), alpha = 0.6, size = 4) +
+  geom_smooth(aes(group = Treat), method = "loess", se = TRUE) +
+  season_lines +
+  scale_color_manual(values = treatment_colors) + scale_fill_manual(values = treatment_colors) +
+  scale_shape_manual(values = c("5" = 16, "10" = 17, "20" = 8)) +
+  scale_y_continuous(breaks = seq(0, 1000, by = 200)) + x_scale +
+  labs(x = NULL, y = bquote(atop("Soil redox", ~ mV)), shape = "Depth (cm)") +
+  guides(color = "none", fill = "none") + ts_theme +
+  theme(legend.position = c(0.9, 0.4), legend.direction = "vertical")
+
+# Daily rain (sum of the hourly totals)
+plot_rain <- met_daily %>% filter(DATE >= win_start, DATE <= win_end) %>%
+  mutate(datetime = as.POSIXct(DATE, tz = tz_l)) %>%
+  ggplot(aes(datetime, rain)) +
+  geom_col(fill = "black", width = 86400) +
+  season_lines +
+  scale_x_datetime(limits = c(x_min, x_max), breaks = seq(x_min, x_max, by = "20 days"),
+                   labels = scales::date_format("%d-%b")) +
+  labs(x = NULL, y = "Rainfall \n mm") +
+  theme(panel.grid = element_blank(), text = element_text(size = 20),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 20))
+
+Fig_2 <- plot_FCH4 / plot_FCO2 / plot_SWC / plot_sap / plot_gwl / plot_redox / plot_rain +
+  plot_annotation(tag_levels = "a") & theme(plot.tag = element_text(size = 15))
+print(Fig_2)
+ggsave(file.path(fig_dir, "Fig2_timeseries.png"), Fig_2, width = 16, height = 22, dpi = 300, bg = "white")
+```
+
+# Do CH4 flux and soil moisture differ between treatments in each season? (Fig. 3)
+
+```{r}
+#| label: fig3-season-boxplot
+#| fig-width: 16
+#| fig-height: 9
+# Output: Fig. 3 (hourly treatment medians per season; paired Wilcoxon on hours with both treatments)
+make_boxplot <- function(df, season_name, var, ylab = NULL, ylim_vals = NULL, show_title = FALSE,
+                         xlabels = NULL, y_pval = NULL, panel_label = NULL, hline = NULL) {
+  df_season <- df %>%
+    filter(season == season_name) %>%
+    mutate(Treat = factor(Treat, levels = c("Root-free", "Control"))) %>%
+    dplyr::select(datetime, Treat, value = {{ var }}) %>%
+    group_by(datetime) %>% filter(n_distinct(Treat) == 2) %>% ungroup()
+  df_wide <- df_season %>% pivot_wider(names_from = Treat, values_from = value, values_fn = median)
+  pval <- wilcox.test(df_wide$Control, df_wide$`Root-free`, paired = TRUE)$p.value
+  if (is.null(y_pval)) y_pval <- min(df_season$value, na.rm = TRUE)
+  g <- ggplot(df_season, aes(Treat, value, fill = Treat)) +
+    geom_boxplot(outlier.shape = NA, color = "black", alpha = 0.9) +
+    annotate("text", x = 0.8, y = y_pval, label = paste0("p = ", signif(pval, 3)), size = 5, hjust = 0) +
+    scale_fill_manual(values = treatment_colors) +
+    labs(x = NULL, y = ylab, title = if (show_title) season_name) +
+    theme(legend.position = "none", panel.grid = element_blank(), text = element_text(size = 20),
+          axis.text.x = element_text(size = 16)) +
+    scale_x_discrete(labels = xlabels)
+  if (!is.null(hline)) g <- g + geom_hline(yintercept = hline, linetype = "dashed", color = "darkgray")
+  if (!is.null(panel_label)) g <- g + annotate("text", x = -Inf, y = Inf, label = panel_label,
+                                               hjust = -0.3, vjust = 1.2, size = 6)
+  if (!is.null(ylim_vals)) g <- g + coord_cartesian(ylim = ylim_vals)
+  g
+}
+
+seasons <- c("Spring", "Summer", "Fall", "Winter")
+ch4_box <- purrr::map2(seasons, c("a)", "b)", "c)", "d)"), function(s, lab)
+  make_boxplot(flux_hour_trt, s, median_FCH4,
+               ylab = if (s == "Spring") bquote(atop("CH"[4] ~ "flux", ~ nmol ~ m^{-2} ~ s^{-1})),
+               ylim_vals = c(-3, 2), show_title = TRUE, y_pval = -3, panel_label = lab, hline = 0))
+swc_box <- purrr::map2(seasons, c("e)", "f)", "g)", "h)"), function(s, lab)
+  make_boxplot(flux_hour_trt, s, median_SWC,
+               ylab = if (s == "Spring") bquote(atop("Soil moisture", ~ m^3 ~ m^{-3})),
+               ylim_vals = c(0.1, 0.62), xlabels = c("Root-free", "Control"), y_pval = 0.1,
+               panel_label = lab, hline = 0.4))
+
+Fig_3 <- ggarrange(plotlist = c(ch4_box, swc_box), ncol = 4, nrow = 2, align = "hv")
+print(Fig_3)
+ggsave(file.path(fig_dir, "Fig3_season_boxplot.png"), Fig_3, width = 16, height = 9, dpi = 300, bg = "white")
+```
+
+# Q1. Do roots modulate the water-table control of soil moisture and CH4? (Fig. 4)
+
+```{r}
+#| label: fig4-watertable-coupling
+#| fig-width: 12
+#| fig-height: 5
+# Output: Fig. 4 (SWC and CH4 vs TR water table, by treatment) + table of per-port slopes.
+# H1a: with roots, SWC (and CH4) follow the water table more strongly (steeper slope in Control).
+# Days with the TR water table above its sensor only (measured values, no gap filling).
+# Inference: one slope per port (port = experimental unit), Control mean minus Root-free mean,
+# compared with all 70 ways of assigning 4 of the 8 ports to Control (smallest p = 1/70 = 0.014).
+cpl_port <- swc_daily %>%
+  dplyr::select(DATE, PORT, Treat, swc) %>%
+  left_join(ch4_all %>% dplyr::select(DATE, PORT, fch4), by = c("DATE", "PORT")) %>%
+  left_join(wells_daily %>% dplyr::select(DATE, TR, tr_obs), by = "DATE") %>%
+  filter(DATE >= win_start, DATE <= win_end, tr_obs)
+
+slope_of <- function(y, x) { ok <- is.finite(y) & is.finite(x); if (sum(ok) < 10) NA_real_ else coef(lm(y[ok] ~ x[ok]))[[2]] }
+port_slopes <- cpl_port %>%
+  group_by(PORT, Treat) %>%
+  summarise(n_days = n(),
+            b_swc = slope_of(swc, TR),          # m3 m-3 per m of water table
+            b_ch4 = slope_of(fch4, TR),         # nmol m-2 s-1 per m of water table
+            .groups = "drop") %>%
+  arrange(PORT)
+print(port_slopes)
+
+# Randomization test. alternative = "greater": Control slope > Root-free (H1a, a priori);
+# "two.sided" for CH4, whose direction was not set in advance.
+perm_test <- function(b, ports, ctrl_ports, alternative = c("greater", "two.sided")) {
+  alternative <- match.arg(alternative)
+  stat <- function(cp) mean(b[ports %in% cp]) - mean(b[!ports %in% cp])
+  obs  <- stat(ctrl_ports)
+  null <- purrr::map_dbl(port_assignments, stat)
+  p <- if (alternative == "greater") mean(null >= obs - 1e-12) else mean(abs(null) >= abs(obs) - 1e-12)
+  tibble(diff_control_minus_rootfree = obs, p_randomization = p, alternative = alternative)
+}
+ports_num  <- as.integer(as.character(port_slopes$PORT))
+ctrl_ports <- ports_num[port_slopes$Treat == "Control"]
+coupling_tbl <- bind_rows(
+  perm_test(port_slopes$b_swc, ports_num, ctrl_ports, "greater")   %>% mutate(response = "SWC (m3 m-3 per m)"),
+  perm_test(port_slopes$b_ch4, ports_num, ctrl_ports, "two.sided") %>% mutate(response = "CH4 (nmol m-2 s-1 per m)")) %>%
+  mutate(mean_slope_Control   = c(mean(port_slopes$b_swc[port_slopes$Treat == "Control"]),
+                                  mean(port_slopes$b_ch4[port_slopes$Treat == "Control"])),
+         mean_slope_Root_free = c(mean(port_slopes$b_swc[port_slopes$Treat == "Root-free"]),
+                                  mean(port_slopes$b_ch4[port_slopes$Treat == "Root-free"]))) %>%
+  relocate(response, mean_slope_Control, mean_slope_Root_free)
+print(coupling_tbl, width = Inf)
+
+# Figure: daily treatment medians vs water table, one regression line per treatment
+cpl_trt <- cpl_port %>%
+  group_by(DATE, Treat, TR) %>%
+  summarise(swc = median(swc, na.rm = TRUE), fch4 = median(fch4, na.rm = TRUE), .groups = "drop")
+cpl_panel <- function(var, ylab, sub) {
+  ggplot(cpl_trt, aes(TR * 100, .data[[var]], colour = Treat, fill = Treat)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    geom_smooth(method = "lm", formula = y ~ x, alpha = 0.2) +
+    scale_colour_manual(values = treatment_colors) + scale_fill_manual(values = treatment_colors) +
+    labs(x = "TR water table (cm, relative to the ground)", y = ylab, subtitle = sub, colour = NULL, fill = NULL) +
+    theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 14))
+}
+p_cpl <- coupling_tbl$p_randomization
+Fig_4 <- cpl_panel("swc", bquote("Soil moisture" ~ (m^3 ~ m^{-3})),
+                   sprintf("Slope difference (C - R) = %.2f per m, p = %.3f",
+                           coupling_tbl$diff_control_minus_rootfree[1], p_cpl[1])) +
+  cpl_panel("fch4", bquote(CH[4] ~ "flux" ~ (nmol ~ m^{-2} ~ s^{-1})),
+            sprintf("Slope difference (C - R) = %.2f per m, p = %.3f",
+                    coupling_tbl$diff_control_minus_rootfree[2], p_cpl[2])) +
+  plot_layout(guides = "collect") + plot_annotation(tag_levels = "a") &
+  theme(legend.position = "top")
+print(Fig_4)
+ggsave(file.path(fig_dir, "Fig4_watertable_coupling.png"), Fig_4, width = 12, height = 5, dpi = 300, bg = "white")
+```
+
+# How much CH4 did each treatment take up over the study? (Fig. 5; gap filling in Fig. S1)
+
+```{r}
+#| label: ch4-gapfill
+#| fig-width: 14
+#| fig-height: 10
+# Output: Fig. S1 (observed and gap-filled hourly CH4 flux, per treatment)
+# Hourly treatment medians, converted to per hour; gaps < 24 h filled by linear interpolation,
+# the rest with the monthly median of the treatment (gap_flag 0 = observed, 1 = linear, 2 = monthly).
+flux_gf_in <- flux_hour_trt %>%
+  filter(median_FCH4 < 250, median_FCH4 > -250) %>%          # removes extreme hours
+  transmute(Treat, datetime, median_FCH4 = median_FCH4 * 3600)
+
+full_grid <- crossing(Treat = factor(c("Control", "Root-free"), levels = levels(flux$Treat)),
+                      datetime = seq(study_start, study_end, by = "1 hour"))
+
+ch4_gapfilled <- full_grid %>%
+  left_join(flux_gf_in, by = c("Treat", "datetime")) %>%
+  mutate(month = month(datetime)) %>%
+  group_by(Treat) %>% arrange(datetime, .by_group = TRUE) %>%
+  mutate(FCH4_linear = zoo::na.approx(median_FCH4, x = as.numeric(datetime), maxgap = 23, na.rm = FALSE)) %>%
+  group_by(Treat, month) %>%
+  mutate(med_FCH4 = median(median_FCH4, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(med_FCH4 = if_else(is.finite(med_FCH4), med_FCH4, NA_real_),
+         FCH4_GP  = coalesce(FCH4_linear, med_FCH4),
+         gap_flag = case_when(!is.na(median_FCH4) ~ 0, !is.na(FCH4_linear) ~ 1, TRUE ~ 2)) %>%
+  dplyr::select(-FCH4_linear, -med_FCH4)
+
+ch4_gapfilled %>% count(Treat, gap_flag) %>% group_by(Treat) %>% mutate(pct = round(100 * n / sum(n), 1)) %>% print()
+
+rain_daily_plot <- met_daily %>% filter(DATE >= win_start, DATE <= win_end) %>%
+  mutate(datetime = as.POSIXct(DATE, tz = tz_l))
+season_lines <- geom_vline(xintercept = season_division_dates, linetype = "dashed", colour = "darkgrey")
+
+plot_gf <- ggplot(ch4_gapfilled, aes(datetime, FCH4_GP, colour = factor(gap_flag))) +
+  geom_point(size = 0.5, alpha = 0.7) +
+  facet_wrap(~ Treat, ncol = 1) + season_lines +
+  scale_colour_manual(values = c("0" = "black", "1" = "red", "2" = "blue"),
+                      labels = c("Observed", "Linear interpolation", "Monthly median"), name = NULL) +
+  scale_x_datetime(limits = c(x_min, x_max), breaks = seq(x_min, x_max, by = "20 days")) +
+  coord_cartesian(ylim = c(-20000, 20000)) +
+  labs(x = NULL, y = expression(CH[4] ~ flux ~ (nmol ~ m^{-2} ~ h^{-1}))) +
+  theme(panel.grid = element_blank(), legend.position = "top", axis.text.x = element_blank(),
+        strip.text = element_text(size = 14, face = "bold"))
+plot_gf_gwl <- gw_tr %>% filter(datetime >= study_start, datetime <= study_end) %>%
+  ggplot(aes(datetime, gwl * 100)) +
+  geom_line(colour = "steelblue4", linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkgrey") + season_lines +
+  scale_x_datetime(limits = c(x_min, x_max), breaks = seq(x_min, x_max, by = "20 days")) +
+  labs(x = NULL, y = "Water table\n(cm)") +
+  theme(panel.grid = element_blank(), axis.text.x = element_blank())
+plot_gf_rain <- ggplot(rain_daily_plot, aes(datetime, rain)) +
+  geom_col(fill = "black", width = 86400) + season_lines +
+  scale_x_datetime(limits = c(x_min, x_max), breaks = seq(x_min, x_max, by = "20 days"),
+                   labels = scales::date_format("%d-%b")) +
+  labs(x = NULL, y = "Daily rainfall\n(mm)") +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1, size = 12))
+
+Fig_S1 <- plot_gf / plot_gf_gwl / plot_gf_rain + plot_layout(heights = c(4, 1.5, 1.2))
+print(Fig_S1)
+ggsave(file.path(fig_dir, "FigS1_ch4_gapfill.png"), Fig_S1, width = 14, height = 10, dpi = 300, bg = "white")
+```
+
+```{r}
+#| label: fig5-cumulative
+#| fig-width: 14
+#| fig-height: 6
+# Output: Fig. 5 (cumulative CH4 flux per treatment over the study window)
+ch4_cumulative <- ch4_gapfilled %>%
+  group_by(Treat) %>% arrange(datetime, .by_group = TRUE) %>%
+  mutate(FCH4_cum = cumsum(replace_na(FCH4_GP, 0))) %>%
+  ungroup()
+
+ch4_cumulative %>% group_by(Treat) %>%
+  summarise(total_nmol_m2 = last(FCH4_cum), total_g_CH4_m2 = last(FCH4_cum) * 16 * 1e-9) %>% print()
+
+Fig_5 <- ggplot(ch4_cumulative, aes(datetime, FCH4_cum * 16 * 1e-9, colour = Treat, fill = Treat)) +   # nmol -> g CH4 (16 g mol-1)
+  geom_area(alpha = 0.20, position = "identity", linewidth = 0.4) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray") +
+  geom_vline(xintercept = season_division_dates, linetype = "dashed", color = "darkgray", linewidth = 0.5) +
+  scale_color_manual(values = treatment_colors) + scale_fill_manual(values = treatment_colors) +
+  scale_x_datetime(limits = c(x_min, x_max), breaks = seq(x_min, x_max, by = "20 days"),
+                   labels = scales::date_format("%d-%b")) +
+  labs(x = NULL, y = bquote(atop("Cumulative" ~ "CH"[4] ~ "flux", ~ g ~ "CH"[4] ~ m^{-2})),
+       colour = NULL, fill = NULL) +
+  theme_bw(base_size = 16) +
+  theme(legend.position = c(0.15, 0.2), panel.grid = element_blank(), text = element_text(size = 20),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 20))
+print(Fig_5)
+ggsave(file.path(fig_dir, "Fig5_cumulative_ch4.png"), Fig_5, width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+# Q2. Do roots act on CH4 at the diel or at the seasonal scale? (Figs. 6 and 7)
+
+```{r}
+#| label: fig6-diel
+#| fig-width: 14
+#| fig-height: 12
+# Output: Fig. 6 (diel cycle, Jul-Oct: hour-of-day median of CH4, SWC, soil temperature per
+# treatment, and sap flux). If roots acted within the day, Control SWC/CH4 would follow sap flux.
+month_levels <- c("July", "August", "September", "October")
+add_month_hour <- function(df) {
+  df %>%
+    mutate(month = as.character(lubridate::month(datetime, label = TRUE, abbr = FALSE, locale = "C")),
+           hour  = hour(datetime)) %>%
+    filter(month %in% month_levels) %>%
+    mutate(month = factor(month, levels = month_levels))
+}
+diel_trt <- flux_hour_trt %>% add_month_hour()
+diel_sum <- function(var) diel_trt %>% group_by(month, hour, Treat) %>%
+  summarise(median_val = median(.data[[var]], na.rm = TRUE), .groups = "drop")
+sap_diel <- sap_hour %>% filter(datetime >= study_start, datetime <= study_end) %>% add_month_hour() %>%
+  group_by(month, hour) %>% summarise(median_val = median(F, na.rm = TRUE), .groups = "drop")
+
+make_hourly_plot <- function(df, ylab, treatment = TRUE, show_x_axis = FALSE, show_strip = FALSE,
+                             ylim_vals = NULL) {
+  g <- if (treatment) {
+    ggplot(df, aes(hour, median_val, color = Treat, fill = Treat)) +
+      geom_smooth(method = "loess", formula = y ~ x, alpha = 0.2) + geom_point(size = 2) +
+      scale_color_manual(values = treatment_colors) + scale_fill_manual(values = treatment_colors)
+  } else {
+    ggplot(df, aes(hour, median_val)) +
+      geom_smooth(method = "loess", formula = y ~ x, color = "black", fill = "gray50", alpha = 0.3) +
+      geom_point(color = "black", size = 2)
+  }
+  g <- g +
+    geom_vline(xintercept = c(9, 15), linetype = "dotted", color = "black", linewidth = 0.6) +
+    facet_wrap(~ month, nrow = 1) +
+    scale_x_continuous(breaks = seq(0, 21, by = 3), limits = c(0, 23)) +
+    labs(x = if (show_x_axis) "Hour of day" else NULL, y = ylab) +
+    theme(panel.grid = element_blank(), text = element_text(size = 18),
+          axis.text.x = if (show_x_axis) element_text(size = 14) else element_blank(),
+          strip.background = element_rect(fill = "white", color = "black"),
+          strip.text = if (show_strip) element_text(size = 16, face = "bold") else element_blank())
+  if (!is.null(ylim_vals)) g <- g + coord_cartesian(ylim = ylim_vals)
+  g
+}
+
+Fig_6 <- make_hourly_plot(diel_sum("median_FCH4"), bquote(atop("CH"[4] ~ "flux", ~ nmol ~ m^{-2} ~ s^{-1})),
+                          show_strip = TRUE, ylim_vals = c(-2, 0.3)) /
+  make_hourly_plot(diel_sum("median_SWC"), bquote(atop("Soil moisture", ~ m^3 ~ m^{-3}))) /
+  make_hourly_plot(diel_sum("median_TS"), "Soil Temp \n°C", ylim_vals = c(10, 25)) /
+  make_hourly_plot(sap_diel, bquote(atop("Sap flux", ~ cm^3 ~ cm^{-2} ~ s^{-1})), treatment = FALSE,
+                   show_x_axis = TRUE) +
+  plot_layout(guides = "collect") & theme(legend.position = "top", legend.title = element_blank())
+print(Fig_6)
+ggsave(file.path(fig_dir, "Fig6_diel_summer.png"), Fig_6, width = 14, height = 12, dpi = 300, bg = "white")
+```
+
+```{r}
+#| label: fig7-dry-day-drying
+#| fig-width: 11
+#| fig-height: 5
+# Output: Fig. 7 (seasonal root effect: drying of the soil on rain-free days, per port).
+# Root-free soil loses water by evaporation + drainage; Control loses the same plus root uptake.
+# Difference in differences per port: mean dry-day dSWC in leaf-on minus leaf-off. If roots dry the
+# soil in the growing season, every Control port should be more negative than the Root-free ports.
+# Port randomization (70 assignments), one-sided (Control more negative); smallest p = 0.014.
+layer_m <- 0.10   # soil layer represented by the 5 cm port sensor (m): assumption, for mm d-1
+
+dry_dates <- drivers_all %>% arrange(DATE) %>%
+  filter(rain < rain_min_mm, lag(rain) < rain_min_mm) %>% pull(DATE)   # no rain today or yesterday
+
+swc_change_port <- swc_daily %>%
+  arrange(PORT, DATE) %>%
+  group_by(PORT) %>%
+  mutate(dswc = if_else(as.numeric(DATE - lag(DATE)) == 1, swc - lag(swc), NA_real_)) %>%
+  ungroup() %>%
+  filter(!is.na(dswc), DATE %in% dry_dates, DATE >= win_start, DATE <= win_end) %>%
+  mutate(leaf = factor(if_else(DATE >= leafon_start & DATE <= leafon_end, "leaf-on", "leaf-off"),
+                       levels = c("leaf-off", "leaf-on")))
+
+did_port <- swc_change_port %>%
+  group_by(PORT, Treat, leaf) %>%
+  summarise(mean_dswc = mean(dswc), n_days = n(), .groups = "drop")
+did_wide <- did_port %>%
+  dplyr::select(PORT, Treat, leaf, mean_dswc) %>%
+  pivot_wider(names_from = leaf, values_from = mean_dswc) %>%
+  mutate(did = `leaf-on` - `leaf-off`, port_num = as.integer(as.character(PORT))) %>%
+  arrange(did)
+print(did_wide)
+
+did_stat <- function(cp) mean(did_wide$did[did_wide$port_num %in% cp]) - mean(did_wide$did[!did_wide$port_num %in% cp])
+did_obs  <- did_stat(did_wide$port_num[did_wide$Treat == "Control"])
+did_null <- purrr::map_dbl(port_assignments, did_stat)
+did_p    <- mean(did_null <= did_obs + 1e-12)
+tibble(did_control_minus_rootfree_m3m3_d = did_obs, p_randomization = did_p,
+       extra_uptake_mm_d = -did_obs * layer_m * 1000) %>% print()
+
+p7a <- did_port %>%
+  ggplot(aes(leaf, mean_dswc, group = PORT, colour = Treat)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_line(linewidth = 0.8) + geom_point(size = 3) +
+  scale_colour_manual(values = treatment_colors) +
+  labs(x = NULL, y = bquote("Dry-day" ~ Delta * "SWC" ~ (m^3 ~ m^{-3} ~ d^{-1})), colour = NULL) +
+  theme(panel.grid = element_blank(), text = element_text(size = 14), legend.position = "top")
+p7b <- did_wide %>%
+  ggplot(aes(reorder(PORT, did), did, fill = Treat)) +
+  geom_col() + geom_hline(yintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = treatment_colors) +
+  labs(x = "Port", y = bquote("Leaf-on minus leaf-off" ~ (m^3 ~ m^{-3} ~ d^{-1})), fill = NULL,
+       subtitle = sprintf("Control - Root-free = %.4f m3 m-3 d-1\nrandomization p = %.3f", did_obs, did_p)) +
+  theme(panel.grid = element_blank(), text = element_text(size = 14), legend.position = "none")
+Fig_7 <- p7a + p7b + plot_annotation(tag_levels = "a")
+print(Fig_7)
+ggsave(file.path(fig_dir, "Fig7_dry_day_drying.png"), Fig_7, width = 11, height = 5, dpi = 300, bg = "white")
+```
+
+
+# Q3. Is the water table driven by transpiration or by external hydrology? (Fig. 8)
+
+A. Water table: rainfall accounts for ~97% of the R² of daily variation (R² 0.31 with sap flow, 0.40 with GPP). Transpiration and exchange with the estuary and Lake Erie account for less than 3%: on a daily basis, transpiration does not drive the water table. B. Recession: no significant extra drawdown on rain-free leaf-on days in TR (CI −1.8 to 8 cm/d); the WTE placebo gives the same. C. By treatment: the dCH4 response to transpiration differs between treatments (C−R = −0.26 with sap flow, −0.04 with GPP; p = 0.03 for both), negative in Control (more uptake) and positive in Root-free. For dSWC the difference is marginal (p = 0.09).
+
+Message to the reviewer: the water table is controlled by external hydrology, mainly rainfall, not by transpiration. Still, the CH4 response to transpiration depends on roots, so roots modulate the flux locally rather than by lowering the water table.
+
+```{r}
+#| label: fig8-transpiration-vs-hydrology
+#| fig-width: 14
+#| fig-height: 10
+# Q3 / Fig. 8: how much of the TR water-table change is driven by transpiration vs external
+# hydrology, and how each drives SWC and CH4 in each treatment.
+# A. Daily water balance of the TR well (days with TR measured today and yesterday):
+#      dTR = rain + exchange with the estuary (TR - WTE, previous day) + dLake + transpiration
+#    Daily CHANGES remove the shared seasonal trend that confounded the SEM. LMG share of R2
+#    (95% CI, 14-day block bootstrap); Random Forest (blocked CV) as check.
+# B. Seasonal scale: extra recession on rain-free days, leaf-on vs leaf-off, TR vs WTE (placebo).
+# C. Per-port daily change of SWC and CH4 ~ the same drivers (per SD); Control - Root-free
+#    difference of each coefficient, 70-assignment port randomization (two-sided).
+p_load(ranger)
+n_boot_q3 <- 500
+
+lake_file <- c(here::here("data", "external", "processing_outputs", "lake_erie_daily.csv"),
+               here::here("data", "MODIS_NOAA", "processing_outputs", "lake_erie_daily.csv"))
+lake_file <- lake_file[file.exists(lake_file)][1]
+lake_d <- if (is.na(lake_file)) {
+  message("lake_erie_daily.csv not found: models run without the Lake Erie term")
+  tibble(DATE = as.Date(character()), lake = numeric())
+} else read_csv(lake_file, show_col_types = FALSE) %>% dplyr::select(DATE, lake)
+
+wb <- gw %>%
+  filter(Plot %in% c("TR", "WTE")) %>%
+  group_by(DATE = as_date(datetime), Plot) %>%
+  summarise(wl = mean(gwl_median, na.rm = TRUE), .groups = "drop") %>%
+  mutate(wl = if_else(is.finite(wl), wl, NA_real_)) %>%
+  pivot_wider(names_from = Plot, values_from = wl) %>%
+  tidyr::complete(DATE = seq(win_start - 1, win_end, by = "day")) %>%
+  left_join(met_daily %>% dplyr::select(DATE, rain), by = "DATE") %>%
+  left_join(lake_d, by = "DATE") %>%
+  left_join(sap_d, by = "DATE") %>%
+  left_join(gpp_8d %>% dplyr::select(DATE, gpp), by = "DATE") %>%
+  arrange(DATE) %>%
+  tidyr::fill(gpp, .direction = "down") %>%
+  mutate(tr_obs    = !is.na(TR) & TR > tr_floor,
+         dTR       = if_else(tr_obs & lag(tr_obs), TR - lag(TR), NA_real_),
+         dWTE      = WTE - lag(WTE),
+         grad_prev = lag(TR - WTE),
+         dlake     = lake - lag(lake),
+         leaf      = factor(if_else(DATE >= leafon_start & DATE <= leafon_end, "leaf-on", "leaf-off"),
+                            levels = c("leaf-off", "leaf-on"))) %>%
+  filter(DATE >= win_start, DATE <= win_end)
+
+hydro_terms <- c("rain", "grad_prev", if (!is.na(lake_file)) "dlake")
+term_lab <- c(rain = "Rain", grad_prev = "Exchange with estuary (TR - WTE)", dlake = "Lake Erie change",
+              sap_mid = "Transpiration: sap flux", gpp = "Transpiration: MODIS GPP")
+proxies_q3 <- c(sap_mid = "Sap flux", gpp = "MODIS GPP")
+
+# LMG: average gain in R2 of each predictor over all orders (Shapley value of R2)
+lmg <- function(d, y, xs) {
+  r2 <- function(v) if (length(v) == 0) 0 else summary(lm(reformulate(v, y), data = d))$r.squared
+  subs <- unlist(lapply(0:length(xs), function(k) combn(xs, k, simplify = FALSE)), recursive = FALSE)
+  key  <- function(s) paste0("k:", paste(sort(s), collapse = "+"))
+  r2s  <- setNames(sapply(subs, r2), sapply(subs, key))
+  p <- length(xs)
+  sapply(xs, function(x) {
+    others <- setdiff(xs, x)
+    sum(sapply(unlist(lapply(0:length(others), function(k) combn(others, k, simplify = FALSE)), recursive = FALSE),
+               function(s) { w <- factorial(length(s)) * factorial(p - length(s) - 1) / factorial(p)
+                             w * (r2s[[key(c(s, x))]] - r2s[[key(s)]]) }))
+  })
+}
+block_rows <- function(d) split(seq_len(nrow(d)), as.integer(d$DATE - win_start) %/% block_days)
+
+# ---- A. Partition of the daily water-table change ----
+partA_tbl <- purrr::imap_dfr(proxies_q3, function(lab, pv) {
+  xs <- c(hydro_terms, pv)
+  d  <- wb %>% dplyr::select(DATE, dTR, all_of(xs)) %>% tidyr::drop_na()
+  m  <- lm(reformulate(xs, "dTR"), data = d)
+  sh <- lmg(d, "dTR", xs)
+  rows <- block_rows(d)
+  set.seed(42)
+  bt <- replicate(n_boot_q3, {
+    db <- d[unlist(rows[sample(names(rows), length(rows), replace = TRUE)]), ]
+    c(lmg(db, "dTR", xs), coef(lm(reformulate(xs, "dTR"), data = db))[xs])
+  })
+  k <- length(xs)
+  folds <- as.integer(d$DATE - win_start) %/% block_days
+  pred <- rep(NA_real_, nrow(d))
+  for (f in unique(folds)) {
+    rf <- ranger(reformulate(xs, "dTR"), data = d[folds != f, ], num.trees = 500, seed = 42)
+    pred[folds == f] <- predict(rf, d[folds == f, ])$predictions
+  }
+  rf_all <- ranger(reformulate(xs, "dTR"), data = d, num.trees = 500, importance = "permutation", seed = 42)
+  tibble(proxy = lab, term = xs, label = term_lab[xs], n_days = nrow(d),
+         r2_lm = summary(m)$r.squared,
+         coef = coef(m)[xs], coef_low = apply(bt[k + 1:k, , drop = FALSE], 1, quantile, 0.025),
+         coef_high = apply(bt[k + 1:k, , drop = FALSE], 1, quantile, 0.975),
+         lmg_share = sh, lmg_low = apply(bt[1:k, , drop = FALSE], 1, quantile, 0.025),
+         lmg_high = apply(bt[1:k, , drop = FALSE], 1, quantile, 0.975),
+         pct_of_r2 = 100 * sh / sum(sh),
+         rf_cv_r2 = 1 - sum((d$dTR - pred)^2) / sum((d$dTR - mean(d$dTR))^2),
+         rf_importance = rf_all$variable.importance[xs])
+})
+print(partA_tbl %>% mutate(across(where(is.double), ~ signif(.x, 3))), n = Inf, width = Inf)
+
+# ---- B. Seasonal scale: extra recession on rain-free days ----
+recession <- function(dv, lev, extra, well) {
+  d <- wb %>% filter(DATE %in% dry_dates) %>%
+    transmute(DATE, leaf, y = .data[[dv]], prev = lag(.data[[lev]])[match(DATE, wb$DATE)],
+              x2 = .data[[extra]]) %>% tidyr::drop_na()
+  f <- y ~ leaf + prev + x2
+  est <- coef(lm(f, data = d))[["leafleaf-on"]]
+  rows <- block_rows(d)
+  set.seed(42)
+  bt <- replicate(n_boot_q3, tryCatch(coef(lm(f, data = d[unlist(rows[sample(names(rows), length(rows), TRUE)]), ]))[["leafleaf-on"]],
+                                      error = function(e) NA_real_))
+  tibble(well = well, n_days = nrow(d), extra_recession_m_d = est,
+         ci_low = quantile(bt, 0.025, na.rm = TRUE), ci_high = quantile(bt, 0.975, na.rm = TRUE))
+}
+wb <- wb %>% mutate(prevTR = TR, prevWTE = WTE)
+partB_tbl <- bind_rows(
+  recession("dTR",  "prevTR",  "dWTE", "TR (forest)"),
+  recession("dWTE", "prevWTE", "rain", "WTE (no trees, placebo)"))
+print(partB_tbl %>% mutate(across(where(is.double), ~ signif(.x, 3))))
+
+# ---- C. Per-port daily change of SWC and CH4 ~ the same drivers ----
+port_chg <- swc_daily %>% dplyr::select(DATE, PORT, Treat, swc) %>%
+  left_join(ch4_all %>% dplyr::select(DATE, PORT, fch4), by = c("DATE", "PORT")) %>%
+  arrange(PORT, DATE) %>% group_by(PORT) %>%
+  mutate(consec = as.numeric(DATE - lag(DATE)) == 1,
+         dswc  = if_else(consec, swc - lag(swc), NA_real_),
+         dfch4 = if_else(consec, fch4 - lag(fch4), NA_real_)) %>%
+  ungroup() %>%
+  left_join(wb %>% dplyr::select(DATE, rain, grad_prev, any_of("dlake"), sap_mid, gpp), by = "DATE")
+
+partC_tbl <- purrr::imap_dfr(proxies_q3, function(lab, pv) {
+  xs <- c(hydro_terms, pv)
+  purrr::map_dfr(c("dSWC", "dCH4"), function(resp_lab) {
+    resp <- if (resp_lab == "dSWC") "dswc" else "dfch4"
+    d <- port_chg %>% dplyr::select(DATE, PORT, Treat, y = all_of(resp), all_of(xs)) %>% tidyr::drop_na() %>%
+      mutate(across(all_of(xs), z))
+    b <- d %>% group_by(PORT, Treat) %>%
+      group_modify(~ as_tibble(as.list(coef(lm(reformulate(xs, "y"), data = .x))[xs]))) %>% ungroup()
+    pn <- as.integer(as.character(b$PORT)); cp <- pn[b$Treat == "Control"]
+    purrr::map_dfr(xs, function(x) perm_test(b[[x]], pn, cp, "two.sided") %>%
+      mutate(proxy = lab, response = resp_lab, term = x, label = term_lab[[x]],
+             mean_C = mean(b[[x]][b$Treat == "Control"]), mean_R = mean(b[[x]][b$Treat == "Root-free"])))
+  })
+}) %>% relocate(proxy, response, label, mean_C, mean_R)
+print(partC_tbl %>% mutate(across(where(is.double), ~ signif(.x, 3))), n = Inf, width = Inf)
+
+# ---- Figure 8 ----
+p8a <- partA_tbl %>%
+  ggplot(aes(lmg_share, reorder(label, lmg_share))) +
+  geom_col(fill = "grey60") +
+  geom_errorbarh(aes(xmin = lmg_low, xmax = lmg_high), height = 0.2) +
+  facet_wrap(~ proxy, scales = "free_y") +
+  scale_x_continuous(n.breaks = 3) +
+  labs(x = bquote("Share of" ~ R^2 ~ "of daily" ~ Delta * "water table (LMG)"), y = NULL,
+       subtitle = paste0("R2 (lm): ", paste(unique(sprintf("%s %.2f", partA_tbl$proxy, partA_tbl$r2_lm)), collapse = "; "),
+                         "\nRF blocked-CV R2: ", paste(unique(sprintf("%s %.2f", partA_tbl$proxy, partA_tbl$rf_cv_r2)), collapse = "; "))) +
+  theme(panel.grid = element_blank(), text = element_text(size = 13))
+p8b <- partB_tbl %>%
+  ggplot(aes(well, extra_recession_m_d * 100)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_pointrange(aes(ymin = ci_low * 100, ymax = ci_high * 100), size = 0.8) +
+  labs(x = NULL, y = "Extra leaf-on recession\non rain-free days (cm/d)") +
+  theme(panel.grid = element_blank(), text = element_text(size = 13))
+p8c <- partC_tbl %>%
+  mutate(diff = diff_control_minus_rootfree, lab_p = sprintf("p=%.2f", p_randomization)) %>%
+  ggplot(aes(diff, label, colour = p_randomization < 0.05)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(size = 3) + geom_text(aes(label = lab_p), vjust = -0.9, size = 3.2, show.legend = FALSE) +
+  facet_grid(proxy ~ response, scales = "free") +
+  scale_colour_manual(values = c(`TRUE` = "#7AD151FF", `FALSE` = "grey50"), guide = "none") +
+  labs(x = "Control - Root-free coefficient (per SD of the driver)", y = NULL) +
+  theme(panel.grid = element_blank(), text = element_text(size = 13))
+Fig_8 <- (p8a | p8b) / p8c + plot_layout(heights = c(1, 1.3), widths = c(2, 1)) + plot_annotation(tag_levels = "a")
+print(Fig_8)
+ggsave(file.path(fig_dir, "Fig8_transpiration_vs_hydrology.png"), Fig_8, width = 14, height = 10, dpi = 300, bg = "white")
+```
+
+# Q4. Is the effect of transpiration on CH4 causal and mediated by soil moisture? (Fig. 9)
+
+Mean sap flux of the previous 1–7 days predicted daily soil-moisture loss only in Control ports (a: C−R −0.18 to −0.26, p = 0.03 for every window). The direct effect of transpiration on CH4 was ~0 in both treatments (c'). The indirect effect through SWC (ab) was negative in Control and ~0 in Root-free for every window (p = 0.03–0.11, two-sided; n = 4 vs 4). With roots, transpiration lowered CH4 only indirectly: it dries the soil, and drier soil takes up more CH4. Without roots, both paths disappeared.
+
+```{r}
+#| label: fig9-causal-mediation
+#| fig-width: 14
+#| fig-height: 9
+# Q4 / Fig. 9: causal path transpiration -> SWC -> CH4, per port.
+# Predictor: mean sap flux of the previous k days (level, not differenced: differencing created
+# alternating-sign artefacts across lags). Covariates: rain and previous-day SWC.
+#   a  = sap_acc -> dSWC ; b = dSWC -> dCH4 | sap_acc ; cp = direct sap_acc -> dCH4 ; ab = indirect
+# Standardised within port. C - R by 70-assignment port randomization (two-sided).
+# Main: k = 3 days; k = 1-7 as sensitivity.
+med_d <- swc_daily %>% dplyr::select(DATE, PORT, Treat, swc) %>%
+  left_join(ch4_all %>% dplyr::select(DATE, PORT, fch4), by = c("DATE", "PORT")) %>%
+  left_join(drivers_all %>% dplyr::select(DATE, sap_mid, rain), by = "DATE") %>%
+  arrange(PORT, DATE) %>% group_by(PORT) %>%
+  mutate(consec   = as.numeric(DATE - lag(DATE)) == 1,
+         dswc     = if_else(consec, swc  - lag(swc),  NA_real_),
+         dch4     = if_else(consec, fch4 - lag(fch4), NA_real_),
+         swc_prev = lag(swc)) %>% ungroup()
+
+med_k <- function(k) {
+  co <- med_d %>% group_by(PORT) %>%
+    mutate(sap_acc = zoo::rollmeanr(dplyr::lag(sap_mid), k, fill = NA)) %>%
+    group_by(PORT, Treat) %>% group_modify(function(x, g) {
+      x <- x %>% dplyr::select(y = dch4, m = dswc, x = sap_acc, swc_prev, rain) %>%
+        tidyr::drop_na() %>% mutate(across(everything(), z))
+      fa <- coef(lm(m ~ x + swc_prev + rain, x)); fb <- coef(lm(y ~ m + x + swc_prev + rain, x))
+      tibble(a = fa[["x"]], b = fb[["m"]], cp = fb[["x"]], ab = fa[["x"]] * fb[["m"]], n = nrow(x))
+    }) %>% ungroup() %>% mutate(k = k)
+  co
+}
+med_ports <- purrr::map_dfr(1:7, med_k)
+pn_of <- function(d) as.integer(as.character(d$PORT))
+med_tbl <- med_ports %>% group_by(k) %>% group_modify(function(d, g) {
+  pn <- pn_of(d); cpn <- pn[d$Treat == "Control"]
+  purrr::map_dfr(c("a", "b", "cp", "ab"), ~ perm_test(d[[.x]], pn, cpn, "two.sided") %>%
+    mutate(path = .x, mean_C = mean(d[[.x]][d$Treat == "Control"]),
+           mean_R = mean(d[[.x]][d$Treat == "Root-free"])))
+}) %>% ungroup() %>% relocate(k, path, mean_C, mean_R)
+print(med_tbl %>% mutate(across(where(is.double), ~ signif(.x, 3))) %>% arrange(path, k), n = Inf, width = Inf)
+
+path_lab <- c(a = "a: sap (prev. 3 d) -> dSWC", b = "b: dSWC -> dCH4 | sap",
+              cp = "c': direct sap -> dCH4", ab = "ab: indirect via SWC")
+k_main <- 3
+main_pts <- med_ports %>% filter(k == k_main) %>%
+  tidyr::pivot_longer(c(a, b, cp, ab), names_to = "path", values_to = "est") %>%
+  mutate(path_f = factor(path_lab[path], levels = path_lab))
+main_lab <- med_tbl %>% filter(k == k_main) %>%
+  mutate(path_f = factor(path_lab[path], levels = path_lab),
+         lab = sprintf("C-R = %.3f\np = %.3f", diff_control_minus_rootfree, p_randomization))
+p9a <- ggplot(main_pts, aes(Treat, est, colour = Treat)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_jitter(width = 0.08, size = 3, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.4, linewidth = 0.4) +
+  geom_text(data = main_lab, aes(x = 1.5, y = Inf, label = lab), inherit.aes = FALSE, vjust = 1.2, size = 3.4) +
+  facet_wrap(~ path_f, nrow = 1, scales = "free_y", labeller = label_wrap_gen(width = 18)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.35))) +
+  scale_colour_manual(values = treatment_colors, guide = "none") +
+  labs(x = NULL, y = "Standardised coefficient per port") +
+  theme(panel.grid = element_blank(), text = element_text(size = 13), strip.background = element_blank())
+p9b <- med_tbl %>% mutate(path_f = factor(path_lab[path], levels = path_lab)) %>%
+  ggplot(aes(k, diff_control_minus_rootfree)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_line(colour = "grey50") + geom_point(aes(colour = p_randomization < 0.05), size = 3) +
+  facet_wrap(~ path_f, nrow = 1, scales = "free_y", labeller = label_wrap_gen(width = 18)) +
+  scale_colour_manual(values = c(`TRUE` = "#7AD151FF", `FALSE` = "grey50"), guide = "none") +
+  scale_x_continuous(breaks = 1:7) +
+  labs(x = "Window of previous sap flux (days)", y = "Control - Root-free") +
+  theme(panel.grid = element_blank(), text = element_text(size = 13), strip.background = element_blank())
+Fig_9 <- p9a / p9b + plot_layout(heights = c(1.3, 1)) + plot_annotation(tag_levels = "a")
+print(Fig_9)
+ggsave(file.path(fig_dir, "Fig9_causal_mediation.png"), Fig_9, width = 14, height = 9, dpi = 300, bg = "white")
+```
+
+# Supplementary material
+
+## Which variables explain daily CH4 in each treatment? (Fig. S2, mixed models)
+
+```{r}
+#| label: figS2-mixed-model
+#| fig-width: 11
+#| fig-height: 8
+# Output: Fig. S2 (fixed effects) + model table.
+# Daily CH4 per port ~ soil temperature, SWC, water table, VPD, rain (+ sap flux), with port and
+# day as random effects, per treatment. A: no sap flux (all days, incl. Oct-Jan). B: with sap flux
+# (sap-flux days only). Predictors standardized within each model sample (effects per SD).
+df_mixed <- flux %>%
+  group_by(Date = as_date(datetime), Treat, PORT) %>%
+  summarise(FCH4 = median(FCH4, na.rm = TRUE), Temp = median(TS_1, na.rm = TRUE),
+            SWC = median(SWC_1, na.rm = TRUE), .groups = "drop") %>%
+  left_join(drivers_all %>% transmute(Date = DATE, Rain = rain, GWL = TR, VPD = vpd_med, SapFlow = sap_mid),
+            by = "Date") %>%
+  mutate(across(where(is.numeric), ~ if_else(is.finite(.x), .x, NA_real_)))
+
+cont_vars <- c("FCH4", "SapFlow", "Rain", "Temp", "SWC", "GWL", "VPD")
+model_forms <- list(
+  `A no sap flux`   = FCH4 ~ Temp + SWC + GWL + VPD + Rain + (1 | PORT) + (1 | Date),
+  `B with sap flux` = FCH4 ~ Temp + SWC + GWL + VPD + SapFlow + Rain + (1 | PORT) + (1 | Date))
+
+model_list <- list(); model_n <- list()
+for (tr in levels(df_mixed$Treat)) {
+  for (m in names(model_forms)) {
+    df_sub <- df_mixed %>%
+      filter(Treat == tr) %>%
+      tidyr::drop_na(all_of(all.vars(model_forms[[m]]))) %>%
+      mutate(across(any_of(cont_vars), ~ as.numeric(scale(.x))))
+    key <- paste(tr, "-", m)
+    model_list[[key]] <- lmer(model_forms[[m]], data = df_sub, REML = TRUE)
+    model_n[[key]] <- tibble(model = key, n_days = n_distinct(df_sub$Date), n_obs = nrow(df_sub))
+  }
+}
+
+purrr::imap_dfr(model_list, function(mod, key) {
+  r2 <- MuMIn::r.squaredGLMM(mod)
+  model_n[[key]] %>% mutate(r2_marginal = round(r2[1], 3), r2_conditional = round(r2[2], 3),
+                            singular = isSingular(mod))
+}) %>% print(width = Inf)
+
+effect_df <- purrr::imap_dfr(model_list, function(mod, key) {
+  broom.mixed::tidy(mod, effects = "fixed", conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(Treatment = sub(" - .*", "", key), model = sub(".* - ", "", key), Sig = conf.low * conf.high > 0)
+})
+Fig_S2 <- ggplot(effect_df, aes(reorder(term, estimate), estimate, fill = ifelse(Sig, Treatment, "grey70"))) +
+  geom_col() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  coord_flip() + facet_grid(Treatment ~ model) +
+  scale_fill_manual(values = c(treatment_colors, "grey70" = "grey70")) +
+  labs(x = "Predictor", y = "Effect size (SD units)") +
+  theme(strip.background = element_blank(), panel.grid = element_blank(),
+        text = element_text(size = 14), legend.position = "none")
+print(Fig_S2)
+ggsave(file.path(fig_dir, "FigS2_mixed_model.png"), Fig_S2, width = 11, height = 8, dpi = 300, bg = "white")
+
+tab_model(model_list, show.se = TRUE, show.ci = 0.95, show.re.var = TRUE, show.icc = TRUE,
+          show.r2 = TRUE, show.ngroups = FALSE, dv.labels = names(model_list),
+          pred.labels = c(`(Intercept)` = "(Intercept)", Temp = "Temperature", SWC = "SWC",
+                          GWL = "Groundwater level", VPD = "VPD", SapFlow = "Sap flow", Rain = "Rain"))
+```
+
+## Does CH4 follow the transpiration proxies differently with and without roots? (Fig. S3)
+
+```{r}
+#| label: figS3-ch4-vs-proxies
+#| fig-width: 12
+#| fig-height: 5
+# Output: Fig. S3 (daily treatment CH4 vs 30-day sap flux, MODIS GPP and stand transpiration) and
+# table of within-treatment slopes (GLS with CAR1 errors, adjusted for soil temperature; per SD).
+proxy_lab <- c(sap_cum30 = "Sap flux (30-d mean)", gpp_cum30 = "MODIS GPP (30-d mean)",
+               E_mean30 = "Stand transpiration (30-d mean, mm/d)")
+
+slope_fit <- function(trt, pv) {
+  d <- resp_daily %>%
+    filter(Treat == trt) %>%
+    dplyr::select(DATE, fch4, ts, x = all_of(pv)) %>%
+    tidyr::drop_na() %>% arrange(DATE) %>%
+    mutate(x_z = z(x), ts_z = z(ts), day_num = as.numeric(DATE - min(DATE)))
+  m <- tryCatch(nlme::gls(fch4 ~ x_z + ts_z, correlation = nlme::corCAR1(form = ~ day_num),
+                          data = d, control = nlme::glsControl(opt = "optim")), error = function(e) NULL)
+  tt <- if (is.null(m)) matrix(NA, 1, 4, dimnames = list("x_z", c("Value", "Std.Error", "t-value", "p-value")))
+        else summary(m)$tTable
+  tibble(proxy = proxy_lab[[pv]], Treat = trt, n_days = nrow(d),
+         spearman_rho = cor(d$x, d$fch4, method = "spearman"),
+         slope_per_sd = tt["x_z", "Value"], se = tt["x_z", "Std.Error"], p_gls = tt["x_z", "p-value"])
+}
+tidyr::expand_grid(trt = c("Control", "Root-free"), pv = names(proxy_lab)) %>%
+  purrr::pmap_dfr(slope_fit) %>%
+  mutate(across(where(is.double), ~ round(.x, 4))) %>%
+  print(n = Inf, width = Inf)
+
+Fig_S3 <- resp_daily %>%
+  pivot_longer(all_of(names(proxy_lab)), names_to = "proxy", values_to = "value") %>%
+  filter(!is.na(value), !is.na(fch4)) %>%
+  mutate(proxy = factor(proxy_lab[proxy], levels = proxy_lab)) %>%
+  ggplot(aes(value, fch4, colour = Treat)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE) +
+  facet_wrap(~ proxy, scales = "free_x") +
+  scale_colour_manual(values = treatment_colors) +
+  labs(x = NULL, y = bquote(CH[4] ~ "flux" ~ (nmol ~ m^{-2} ~ s^{-1})), colour = NULL) +
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 14))
+print(Fig_S3)
+ggsave(file.path(fig_dir, "FigS3_ch4_vs_transpiration.png"), Fig_S3, width = 12, height = 5, dpi = 300, bg = "white")
+```
+
+## Do soil nutrients differ between treatments? (Table S2)
+
+```{#r}
+#| label: tableS2-nutrients
+# Output: Table S2 (median and IQR per nutrient, treatment and depth) and its plot.
+nut_clean <- nut %>%
+  mutate(Treat = case_when(str_detect(Sample.ID, "trC") ~ "Control",
+                           str_detect(Sample.ID, "trE") ~ "Root-free"),
+         Depth = case_when(str_detect(Sample.ID, "10cm") ~ "10 cm",
+                           str_detect(Sample.ID, "20cm") ~ "20 cm",
+                           str_detect(Sample.ID, "40cm") ~ "40 cm")) %>%
+  filter(!is.na(Treat), !is.na(Depth))
+
+table_S2 <- nut_clean %>%
+  group_by(Test, Treat, Depth) %>%
+  summarise(median = median(Results, na.rm = TRUE), IQR = IQR(Results, na.rm = TRUE), n = n(),
+            .groups = "drop")
+print(table_S2, n = Inf)
+write_csv(table_S2, file.path(fig_dir, "TableS2_nutrients.csv"))
+
+nut_plot <- table_S2 %>%
+  mutate(Depth = factor(Depth, levels = c("40 cm", "20 cm", "10 cm"))) %>%
+  ggplot(aes(median, Depth, colour = Treat)) +
+  geom_errorbarh(aes(xmin = pmax(0, median - IQR / 2), xmax = median + IQR / 2),
+                 height = 0.18, linewidth = 0.8, position = position_dodge(width = 0.45)) +
+  geom_point(size = 4, position = position_dodge(width = 0.45)) +
+  facet_wrap(~ Test, scales = "free_x", ncol = 3) +
+  scale_colour_manual(values = treatment_colors) +
+  labs(x = "Concentration", y = "Depth", colour = "Treatment") +
+  theme(panel.grid = element_blank(), legend.position = "top", strip.background = element_blank(),
+        strip.text = element_text(size = 13, face = "bold"))
+print(nut_plot)
+```
+
+
+## Is there an indirect link transpiration -> SWC -> CH4, and do roots change it? (Fig. S4)
+
+```{r}
+#| label: figS4-transpiration-coupling
+#| fig-width: 12
+#| fig-height: 13
+# Fig. S4: indirect link transpiration -> SWC -> CH4, same design as Fig. 4 for every panel:
+# one slope per port, Control - Root-free difference, 70-assignment port randomization (two-sided,
+# smallest p = 2/70 = 0.029). Sap flux and MODIS GPP slopes per SD of the driver; SWC and water
+# table in natural units. Water-table panel: only days with TR above its sensor (as in Fig. 4).
+s4_port <- swc_daily %>%
+  dplyr::select(DATE, PORT, Treat, swc) %>%
+  left_join(ch4_all %>% dplyr::select(DATE, PORT, fch4), by = c("DATE", "PORT")) %>%
+  left_join(drivers_all %>% dplyr::select(DATE, sap_mid, gpp), by = "DATE") %>%
+  left_join(wells_daily %>% dplyr::select(DATE, TR, tr_obs), by = "DATE") %>%
+  filter(DATE >= win_start, DATE <= win_end) %>%
+  mutate(TR_cm = if_else(tr_obs, TR * 100, NA_real_))
+
+s4_spec <- tribble(
+  ~y,     ~x,        ~xlab,                                 ~per_sd, ~unit,
+  "swc",  "sap_mid", "Sap flux (daily midday)",             TRUE,    "m3 m-3 per SD",
+  "swc",  "gpp",     "MODIS GPP (8-day)",                   TRUE,    "m3 m-3 per SD",
+  "fch4", "sap_mid", "Sap flux (daily midday)",             TRUE,    "nmol m-2 s-1 per SD",
+  "fch4", "gpp",     "MODIS GPP (8-day)",                   TRUE,    "nmol m-2 s-1 per SD",
+  "fch4", "swc",     "Soil moisture (m3 m-3)",              FALSE,   "nmol m-2 s-1 per m3 m-3",
+  "fch4", "TR_cm",   "TR water table (cm, rel. to ground)", FALSE,   "nmol m-2 s-1 per cm")
+
+s4_res <- purrr::pmap(s4_spec, function(y, x, xlab, per_sd, unit) {
+  d  <- s4_port %>% filter(is.finite(.data[[x]]), is.finite(.data[[y]]))
+  sx <- if (per_sd) sd(d[[x]]) else 1
+  b  <- d %>% group_by(PORT, Treat) %>%
+    summarise(n_days = n_distinct(DATE), slope = slope_of(.data[[y]], .data[[x]]) * sx, .groups = "drop")
+  pn <- as.integer(as.character(b$PORT)); cp <- pn[b$Treat == "Control"]
+  list(slopes = b %>% mutate(response = y, driver = xlab),
+       test   = perm_test(b$slope, pn, cp, "two.sided") %>%
+         mutate(response = y, driver = xlab, unit = unit,
+                mean_C = mean(b$slope[b$Treat == "Control"]), mean_R = mean(b$slope[b$Treat == "Root-free"])),
+       data   = d %>% group_by(DATE, Treat) %>%
+         summarise(xv = median(.data[[x]], na.rm = TRUE), yv = median(.data[[y]], na.rm = TRUE), .groups = "drop"))
+})
+print(bind_rows(purrr::map(s4_res, "slopes")) %>% arrange(response, driver, PORT), n = Inf)
+s4_tbl <- bind_rows(purrr::map(s4_res, "test")) %>% relocate(response, driver, unit, mean_C, mean_R)
+print(s4_tbl %>% mutate(across(where(is.double), ~ signif(.x, 3))), width = Inf)
+
+ylab_of <- c(swc = "Soil moisture (m3 m-3)", fch4 = "CH4 flux (nmol m-2 s-1)")
+s4_panels <- purrr::map2(s4_res, seq_len(nrow(s4_spec)), function(r, i) {
+  ggplot(r$data, aes(xv, yv, colour = Treat, fill = Treat)) +
+    geom_point(alpha = 0.4, size = 1.2) +
+    geom_smooth(method = "lm", formula = y ~ x, alpha = 0.2) +
+    scale_colour_manual(values = treatment_colors) + scale_fill_manual(values = treatment_colors) +
+    labs(x = s4_spec$xlab[i], y = ylab_of[[s4_spec$y[i]]], colour = NULL, fill = NULL,
+         subtitle = sprintf("C - R = %.3g %s, p = %.3f", r$test$diff_control_minus_rootfree,
+                            s4_spec$unit[i], r$test$p_randomization)) +
+    theme(panel.grid = element_blank(), text = element_text(size = 12), plot.subtitle = element_text(size = 10))
+})
+Fig_S4 <- wrap_plots(s4_panels, ncol = 2) +
+  plot_layout(guides = "collect") + plot_annotation(tag_levels = "a") & theme(legend.position = "top")
+print(Fig_S4)
+ggsave(file.path(fig_dir, "FigS4_transpiration_coupling.png"), Fig_S4, width = 12, height = 13, dpi = 300, bg = "white")
+```

@@ -111,6 +111,20 @@ df_sap_OWC <- readRDS("df_sap_OWC.rds") %>%
     .groups = "drop"
   )
 
+# Exclude unreliable sap flow:
+#   - winter months (sensors not maintained): Nov, Dec, Jan
+#   - bad data from 14 Oct 2024 until the end of that winter
+sap_bad_months <- c(11, 12, 1)
+sap_bad_start  <- as.POSIXct("2024-10-14 00:00:00", tz = lubridate::tz(df_sap_OWC$datetime))
+sap_bad_end    <- as.POSIXct("2025-06-01 00:00:00", tz = lubridate::tz(df_sap_OWC$datetime))
+
+sap_is_bad <- function(datetime) {
+  month(datetime) %in% sap_bad_months | (datetime >= sap_bad_start & datetime < sap_bad_end)
+}
+
+df_sap_OWC <- df_sap_OWC %>%
+  mutate(F = if_else(sap_is_bad(datetime), NA_real_, F))
+
 #df_L1_sap_vps_gw<-df_ALL_sap_Js%>%left_join(df_L1_root, by = "datetime")
 df_L1_sap_vps_gw<-df_sap_OWC%>%left_join(df_L1_root, by = "datetime")
 
@@ -1202,7 +1216,7 @@ Fig_hourly <- p_ch4 / p_swc / p_ts / p_sap +
 print(Fig_hourly)
 
 ggsave(
-  filename = "fig_hourly_climatology.png",
+  filename = "fig_hourly_climatologyB.png",
   plot = Fig_hourly,
   width = 14,
   height = 12,
@@ -1245,7 +1259,7 @@ summary_stats_hour <- L1_flux %>%
     median_SWC_1 = median(SWC_1, na.rm = TRUE),
     median_TS_1  = median(TS_1, na.rm = TRUE),
     median_gwl   = median(gwl_median, na.rm = TRUE),
-    median_sap   = median(Js_gcms, na.rm = TRUE),
+    median_sap   = median(F, na.rm = TRUE),
 
     # rain: use max per hour to avoid multiplying rain across PORT replicates
     sum_rain     = suppressWarnings(max(rain_sum, na.rm = TRUE)),
@@ -1422,7 +1436,7 @@ p3 <- plot_variable(
 p4 <- plot_variable(
  mensal_median,
   "median_temp",
-  y1 = 0, y2 = 25,
+  y1 = 0, y2 = 30,
   y_label = "Soil Temp \n °C",
   show_months = FALSE,
   show_x = FALSE
@@ -1443,7 +1457,7 @@ p6 <- plot_single_treatment(
   mensal_median,
   "median_sapflow",
   treat_keep = "Control",
-  y1 = 0, y2 = 0.00025,
+  y1 = 0, y2 = 0.005,
   y_label =  bquote(atop("Sapflow", ~g ~ cm^{-2} ~ s^{-1})),
   show_months = FALSE,
   show_x = TRUE
@@ -1453,7 +1467,7 @@ p7 <- plot_single_treatment(
   mensal_median,
   "sum_rain",
   treat_keep = "Control",
-  y1 = 0, y2 = 10,
+  y1 = 0, y2 = 15,
   y_label = "Rainfall \n mm",
   show_months = FALSE,
   show_x = TRUE
@@ -1467,150 +1481,117 @@ panel <- p1 / p2 / p3 / p4 / p5 / p6 / p7
 print(panel)
 
 ```
-
 ## Fig S2 - Mixed Effect model
 
 ```{r}
+# Daily CH4 per port explained by temperature, soil moisture, water table, VPD, rain and
+# sap flux, with port and day as random effects, fitted separately for each treatment.
+# Two models per treatment, because sap flux is only valid Apr to 13 Oct 2024:
+#   A (no sap flux): all days with CH4 and environmental data, including Oct-Jan.
+#   B (with sap flux): only days with valid sap flux.
+# This keeps the Oct-Jan days instead of discarding them only because sap flux is missing.
+# Coefficients are within-treatment associations, which mix all seasonal drivers; whether
+# roots change the CH4 response to transpiration is tested in "Direct test".
 
-
-# -----------------------------
-#  Summarise and scale data 
-# -----------------------------
+# One row per port and day. Missing values are kept here and removed per model below.
 df_mixed <- L1_flux %>%
   mutate(Date = as.Date(datetime)) %>%
   group_by(Date, Treat, PORT) %>%
-  summarise(
-    FCH4    = median(FCH4, na.rm = TRUE),
-    FCO2    = median(FCO2, na.rm = TRUE),
-    #SapFlow = median(Js_kgcms, na.rm = TRUE),
-    SapFlow = median(F, na.rm = TRUE),
-    Rain    = sum(rain_sum, na.rm = TRUE),
-    Temp    = median(TS_1, na.rm = TRUE),
-    SWC     = median(SWC_1, na.rm = TRUE),
-    GWL     = median(gwl_median, na.rm = TRUE),
-    VPD     = median(VPD_hour, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  filter(complete.cases(.)) %>%
-  ungroup()
+  summarise(FCH4    = median(FCH4, na.rm = TRUE),
+            SapFlow = median(F, na.rm = TRUE),
+            Rain    = sum(rain_sum, na.rm = TRUE),
+            Temp    = median(TS_1, na.rm = TRUE),
+            SWC     = median(SWC_1, na.rm = TRUE),
+            GWL     = median(gwl_median, na.rm = TRUE),
+            VPD     = median(VPD_hour, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~ if_else(is.finite(.x), .x, NA_real_)),   # median of all-NA gives NaN
+         Treat = factor(Treat), PORT = factor(PORT))
 
-df_mixed$Treat <- factor(df_mixed$Treat)
-df_mixed$PORT  <- factor(df_mixed$PORT)
+cont_vars <- c("FCH4", "SapFlow", "Rain", "Temp", "SWC", "GWL", "VPD")
+model_forms <- list(
+  `A no sap flux`   = FCH4 ~ Temp + SWC + GWL + VPD + Rain + (1 | PORT) + (1 | Date),
+  `B with sap flux` = FCH4 ~ Temp + SWC + GWL + VPD + SapFlow + Rain + (1 | PORT) + (1 | Date))
 
-cont_vars <- c("FCH4",#"FCO2",
-               "SapFlow","Rain","Temp","SWC","GWL","VPD")
-df_mixed_scaled <- df_mixed
-df_mixed_scaled[cont_vars] <- scale(df_mixed[cont_vars])
-
-# -----------------------------
-#  Models separated by Treatment
-# -----------------------------
-treatments <- levels(df_mixed_scaled$Treat)
+# Each model drops missing values only in its own variables, then standardizes within its
+# own sample, so coefficients are per SD of that sample.
 model_list <- list()
-for(tr in treatments){
-  df_sub <- df_mixed_scaled %>% filter(Treat == tr)
-  model <- lmer(FCH4 ~ Temp + SWC + GWL + VPD + SapFlow + Rain + #FCO2 +
-                  (1|PORT) + (1|Date),
-                data = df_sub, REML = TRUE)
-  model_list[[tr]] <- model
-  
-  # Simple diagnosis
-  cat("\n===== Treatment:", tr, "=====\n")
-  r2_vals <- r.squaredGLMM(model)
-  cat("R² marginal (fixed):", round(r2_vals[1],3), 
-      " | R² conditional (fixed+random):", round(r2_vals[2],3), "\n")
-  
-  # Evaluating Homogeneity of variance. Plot predicted values vs residuals 
-  plot(fitted(model), resid(model),
-       main = paste("Residuals vs Fitted -", tr),
-       xlab = "Fitted", ylab = "Residuals")
-  abline(h=0, col="red", lty=2)
+model_n    <- list()
+for (tr in levels(df_mixed$Treat)) {
+  for (m in names(model_forms)) {
+    df_sub <- df_mixed %>%
+      filter(Treat == tr) %>%
+      tidyr::drop_na(all_of(all.vars(model_forms[[m]]))) %>%
+      mutate(across(any_of(cont_vars), ~ as.numeric(scale(.x))))
+    key <- paste(tr, "-", m)
+    model_list[[key]] <- lmer(model_forms[[m]], data = df_sub, REML = TRUE)
+    model_n[[key]] <- tibble(model = key, n_days = n_distinct(df_sub$Date), n_obs = nrow(df_sub),
+                             first_day = min(df_sub$Date), last_day = max(df_sub$Date))
+  }
 }
 
-  # histogram of the residuals 
+# Sample size, period and R2 of each model (marginal = fixed effects; conditional = + random).
+# A singular fit (a random-effect variance of 0) makes the conditional R2 unreliable.
+purrr::imap_dfr(model_list, function(mod, key) {
+  r2 <- r.squaredGLMM(mod)
+  model_n[[key]] %>% mutate(r2_marginal = round(r2[1], 3), r2_conditional = round(r2[2], 3),
+                            singular = isSingular(mod))
+}) %>% print(width = Inf)
 
-res_df <- do.call(rbind, lapply(names(model_list), function(tr){
-  data.frame(
-    Residuals = resid(model_list[[tr]]),
-    Treatment = tr
-  )
-}))
+# Residual checks: residuals vs fitted (constant spread) and histogram (approximate normality).
+res_df <- purrr::imap_dfr(model_list, ~ tibble(Fitted = fitted(.x), Residuals = resid(.x), model = .y))
 
-hist_resi_plot<-ggplot(res_df, aes(x = Residuals)) +
-  geom_histogram(bins = 30, fill = "grey70", color = "black") +
-  facet_wrap(~Treatment, scales = "free") +
-  theme_bw() +
-  labs(title = "Histogram of model residuals")
+resid_fitted_plot <- ggplot(res_df, aes(Fitted, Residuals)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  facet_wrap(~ model, scales = "free") +
+  theme(panel.grid = element_blank())
+print(resid_fitted_plot)
 
+hist_resi_plot <- ggplot(res_df, aes(Residuals)) +
+  geom_histogram(bins = 30, fill = "grey70", colour = "black") +
+  facet_wrap(~ model, scales = "free") +
+  labs(title = "Histogram of model residuals") +
+  theme(panel.grid = element_blank())
 print(hist_resi_plot)
 
- 
-
-#####################
-
-# -----------------------------
-#  Extracting fixed coeficientes and IC per plot
-# -----------------------------
-effect_dfs <- lapply(names(model_list), function(tr){
-  mod <- model_list[[tr]]
-  df <- tidy(mod, effects="fixed", conf.int=TRUE) %>%
+# Fixed effects with 95% CIs; bars coloured when the CI excludes zero.
+effect_df <- purrr::imap_dfr(model_list, function(mod, key) {
+  tidy(mod, effects = "fixed", conf.int = TRUE) %>%
     filter(term != "(Intercept)") %>%
-    mutate(
-      Treatment = tr,
-      Sig = ifelse(conf.low*conf.high > 0, TRUE, FALSE), 
-      term = fct_reorder(term, estimate)
-    )
+    mutate(Treatment = sub(" - .*", "", key), model = sub(".* - ", "", key),
+           Sig = conf.low * conf.high > 0)
 })
 
-effect_df <- bind_rows(effect_dfs)
-
-# -----------------------------
-# Plotting fixed effects
-# -----------------------------
-treatment_colors <- c("Control"="#7AD151FF","Root-free"="#440154FF")
-
-mml_plot<-ggplot(effect_df, aes(x=term, y=estimate, fill=ifelse(Sig, Treatment, "grey70"))) +
+mml_plot <- ggplot(effect_df, aes(x = reorder(term, estimate), y = estimate,
+                                  fill = ifelse(Sig, Treatment, "grey70"))) +
   geom_col() +
-  geom_errorbar(aes(ymin=conf.low, ymax=conf.high), width=0.3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3) +
+  geom_hline(yintercept = 0, colour = "grey40") +
   coord_flip() +
-  facet_wrap(~Treatment, scales="free_y", ncol=1) +
-  scale_fill_manual(values=c(treatment_colors,"grey70"="grey70")) +
-  labs(x="Predictor", y="Effect size (scaled units)") +
-  theme_bw() +
-  theme(strip.background = element_blank(),
-    panel.grid=element_blank(),
-    text=element_text(size=14),
-    legend.position="none"
-  )
-
-
+  facet_grid(Treatment ~ model) +
+  scale_fill_manual(values = c(treatment_colors, "grey70" = "grey70")) +
+  labs(x = "Predictor", y = "Effect size (SD units)") +
+  theme(strip.background = element_blank(), panel.grid = element_blank(),
+        text = element_text(size = 14), legend.position = "none")
 print(mml_plot)
+ggsave("fig_S2_mixed_model.png", mml_plot, width = 11, height = 8, dpi = 300, bg = "white")
 
-rmle_results<-tab_model(
-  model_list[["Control"]],
-  model_list[["Root-free"]],
-  show.se = TRUE,
-  show.ci = 0.95,
-  show.re.var = TRUE,
-  show.icc = TRUE,
-  show.r2 = TRUE,
-  dv.labels = c("Control", "Root-free"),
-  pred.labels = c(
-    "Temperature",
-    "SWC",
-    "Groundwater level",
-    "VPD",
-    "Sap flow",
-    "Rain",
-    "CO2 flux"
-  )
-)
-
+# Table: four columns (treatment x model). Labels are matched by term name, so the
+# missing SapFlow row in model A does not shift the labels.
+rmle_results <- tab_model(
+  model_list,
+    # The N per group printed by tab_model is wrong when models have different days;
+  # the real number of days per model is in the table printed above (n_days).
+  show.se = TRUE, show.ci = 0.95, show.re.var = TRUE, show.icc = TRUE, show.r2 = TRUE,
+  show.ngroups = FALSE,
+  dv.labels = names(model_list),
+  pred.labels = c(`(Intercept)` = "(Intercept)", Temp = "Temperature", SWC = "SWC",
+                  GWL = "Groundwater level", VPD = "VPD", SapFlow = "Sap flow", Rain = "Rain"))
 print(rmle_results)
-
-
-
 ```
+
+
 
 ## Table S2 - Nutrient averages
 
@@ -1771,97 +1752,1847 @@ nut_plot <- ggplot(
 
 nut_plot
 
-
-library(dplyr)
-library(stringr)
-library(ggplot2)
-
-# ==========================================
-# Colors
-# ==========================================
-
-treatment_colors <- c(
-  "Control"   = "#7AD151FF",
-  "Root-free" = "#440154FF"
-)
-
-# ==========================================
-# Clean data
-# ==========================================
-
-nut_clean <- nut %>%
-  mutate(
-    Treat = case_when(
-      str_detect(Sample.ID, "trC") ~ "Control",
-      str_detect(Sample.ID, "trE") ~ "Root-free",
-      TRUE ~ NA_character_
-    )
-  ) %>%
-  filter(!is.na(Treat))
-
-# check nutrients present
-unique(nut_clean$Test)
-
-# ==========================================
-# Boxplots
-# ==========================================
-
-nut_plot <- ggplot(
-  nut_clean,
-  aes(
-    x = Treat,
-    y = Results,
-    fill = Treat
-  )
-) +
-
-  geom_boxplot(
-    width = 0.6,
-    alpha = 0.7,
-    outlier.shape = NA
-  ) +
-
-  geom_jitter(
-    width = 0.15,
-    size = 1.8,
-    alpha = 0.7,
-    color = "black"
-  ) +
-
-  facet_wrap(
-    ~ Test,
-    scales = "free_y",
-    ncol = 3
-  ) +
-
-  scale_fill_manual(
-    values = treatment_colors
-  ) +
-
-  labs(
-    x = NULL,
-    y = "Concentration",
-    fill = "Treatment"
-  ) +
-
-  theme_bw() +
-
-  theme(
-    panel.grid = element_blank(),
-
-    legend.position = "none",
-
-    strip.background = element_blank(),
-
-    strip.text = element_text(
-      size = 14,
-      face = "bold"
-    ),
-
-    axis.title = element_text(size = 14),
-
-    axis.text = element_text(size = 12)
-  )
-
-nut_plot
 ```
+
+# Setup df for analysis: water table, transpiration, SWC and CH4 data
+
+```{r}
+
+#   Parameters, helper functions and the daily tables used by all following
+#   chunks: weather (met_daily), soil moisture (swc_daily) and CH4 (ch4_all).
+p_load(nlme, ranger, zoo, janitor, MODISTools, mgcv)
+
+# Periods 
+study_start  <- as.POSIXct("2024-04-05 15:00:00") # first and last flux measurements (hourly data)
+study_end    <- as.POSIXct("2025-01-14 16:00:00")
+win_start    <- as_date(study_start)               # same period as dates, for daily tables
+win_end      <- as_date(study_end)
+data_start   <- as.Date("2024-03-25")   # longer period for the wells and the water-balance model
+data_end     <- as.Date("2025-05-15")
+leafon_start <- as.Date("2024-05-20")              # leaf-on window (fixed dates)
+leafon_end   <- as.Date("2024-10-15")
+
+# Data-quality thresholds
+tr_floor    <- -0.49   # TR water-level sensor at ~0.50 m: values at or below are censored
+sap_max     <- 0.1     # sap flux at or above this value is a sensor error
+swc_min     <- 0.05    # SWC below this value is a sensor error
+ts_frozen   <- 0       # days with soil temperature at or below 0 C are excluded (frozen soil)
+min_obs_day <- 4       # minimum SWC measurements per port and day
+rain_min_mm <- 1       # rain-free day: less than 1 mm
+
+# Random forest settings
+cv_block_days <- 14    # length of the blocks held out in cross-validation (days)
+n_trees       <- 500
+
+# Site 
+noaa_station <- "9063079"            # NOAA Marblehead, OH (Lake Erie level)
+site_lat     <- 41.378165
+site_lon     <- -82.508944
+
+treatment_colors <- c("Control" = "#7AD151FF", "Root-free" = "#440154FF")
+well_colors      <- c("TR" = "#7AD151FF", "WTE" = "#2A788EFF", "W" = "#440154FF")
+
+# Helper functions
+# Mean of the last k days, using measured days only.
+# NA when fewer than min_frac of the k days have data (no gap filling).
+roll_mean_obs <- function(x, k, min_frac = 0.8) {
+  zoo::rollapplyr(x, k, function(v) {
+    if (length(v) < k || sum(!is.na(v)) < min_frac * k) NA_real_ else mean(v, na.rm = TRUE)
+  }, partial = TRUE, fill = NA)
+}
+
+# Sum of the last k days; NA unless every day in the window was measured.
+roll_sum_obs <- function(x, k) {
+  zoo::rollapplyr(x, k, function(v) if (length(v) < k || anyNA(v)) NA_real_ else sum(v),
+                  partial = TRUE, fill = NA)
+}
+
+# Standardize to mean 0 and SD 1 (constant or empty vectors return NA).
+z <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - mean(x, na.rm = TRUE)) / s
+}
+
+# Daily weather
+# From df_L1_root (one record per hour), not from df_L1_datetime, which only
+# has rows for hours with sap-flow records and would miss rain.
+met_daily <- df_L1_root %>%
+  mutate(DATE = as_date(datetime)) %>%
+  group_by(DATE) %>%
+  summarise(rain    = sum(rain_sum, na.rm = TRUE),
+            n_hours = sum(!is.na(rain_sum)),
+            vpd_max = suppressWarnings(max(VPD_hour, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(rain    = if_else(n_hours >= 20, rain, NA_real_),       # incomplete days -> NA
+         vpd_max = if_else(is.finite(vpd_max), vpd_max, NA_real_)) %>%
+  dplyr::select(-n_hours)
+
+# Check: total rain and incomplete days in the study period
+# (df_L1_root ends on 2024-12-31, so 1-14 Jan 2025 have no weather data)
+met_daily %>%
+  filter(DATE >= win_start, DATE <= win_end) %>%
+  summarise(total_rain_mm = sum(rain, na.rm = TRUE), days_without_rain_data = sum(is.na(rain))) %>%
+  print()
+
+# Daily SWC per port
+# Median of the day; drops SWC sensor errors, days with few measurements and frozen soil.
+swc_daily <- L1_flux %>%
+  filter(datetime >= study_start, datetime <= study_end) %>%
+  mutate(DATE  = as_date(datetime),
+         SWC_1 = if_else(SWC_1 < swc_min, NA_real_, SWC_1)) %>%
+  group_by(DATE, PORT, Treat) %>%
+  summarise(swc    = median(SWC_1, na.rm = TRUE),
+            ts_min = suppressWarnings(min(TS_1, na.rm = TRUE)),
+            n_obs  = sum(is.finite(SWC_1)), .groups = "drop") %>%
+  filter(n_obs >= min_obs_day, !is.finite(ts_min) | ts_min > ts_frozen) %>%
+  mutate(PORT  = factor(PORT),
+         Treat = factor(Treat, levels = c("Control", "Root-free")))
+
+# Daily CH4 per port
+# Median flux and soil temperature of the day, kept only on days with valid SWC.
+ch4_all <- L1_flux %>%
+  filter(datetime >= study_start, datetime <= study_end) %>%
+  mutate(DATE = as_date(datetime), PORT = factor(PORT)) %>%
+  group_by(DATE, PORT) %>%
+  summarise(fch4 = median(FCH4, na.rm = TRUE),
+            ts   = median(TS_1, na.rm = TRUE), .groups = "drop") %>%
+  inner_join(swc_daily %>% dplyr::select(DATE, PORT, Treat, swc), by = c("DATE", "PORT")) %>%
+  filter(!is.na(fch4), !is.na(ts))
+```
+
+# Drivers: sap flux, MODIS GPP, Lake Erie 
+
+```{r}
+# Lake Erie level from NOAA (one request per month; IGLD datum, local standard time).
+# Downloaded once and saved, so rendering does not depend on the NOAA server.
+get_noaa_level <- function(station, start, end) {
+  months <- seq(floor_date(start, "month"), floor_date(end, "month"), by = "month")
+  purrr::map_dfr(months, function(m) {
+    url <- paste0("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?",
+                  "product=hourly_height&station=", station,
+                  "&begin_date=", format(m, "%Y%m%d"),
+                  "&end_date=", format(ceiling_date(m, "month") - days(1), "%Y%m%d"),
+                  "&datum=IGLD&units=metric&time_zone=lst&format=csv&application=OWC_root_exclusion")
+    out <- tryCatch(clean_names(read_csv(url, show_col_types = FALSE)), error = function(e) NULL)
+    if (is.null(out) || !"water_level" %in% names(out)) return(NULL)   # month not available
+    tibble(datetime   = if (inherits(out$date_time, "POSIXct")) out$date_time else ymd_hm(out$date_time),
+           lake_level = as.numeric(out$water_level))
+  })
+}
+
+lake_file <- "lake_level_hourly_2024_2025.rds"
+if (!file.exists(lake_file)) saveRDS(get_noaa_level(noaa_station, data_start - 40, data_end), lake_file)
+
+lake_d <- readRDS(lake_file) %>%
+  group_by(DATE = as_date(datetime)) %>%
+  summarise(lake = mean(lake_level, na.rm = TRUE), .groups = "drop") %>%
+  mutate(lake_change = lake - lag(lake))   # daily change, used to test external control of the water table
+
+# Sap flux of the TR trees. df_sap_OWC is already hourly, restricted to TR and the
+# study period, with the unreliable months removed ("Preparing df's").
+# F is Granier sap flux density at the sensor (per unit sapwood area); it is NOT scaled
+# to tree or stand sapwood area. sap_mid (midday median, 11-14 h) is the transpiration
+# proxy used in the models (standardized, so its units do not matter there).
+# sap_sum (daily integral of F) is only meaningful for a stand water balance after unit
+# conversion and scaling by sapwood area per ground area (not yet available).
+sap_d <- df_sap_OWC %>%
+  mutate(F = if_else(F >= sap_max, NA_real_, F),
+         DATE = as_date(datetime), hr = hour(datetime)) %>%
+  group_by(DATE, Sensor_ID) %>%
+  summarise(sap_mid = median(F[hr %in% 11:14], na.rm = TRUE),
+            sap_sum = sum(F, na.rm = TRUE) * 3600,
+            n_hours = sum(is.finite(F)), .groups = "drop") %>%
+  filter(n_hours >= 20, is.finite(sap_mid)) %>%
+  group_by(DATE) %>%         # median across sensors: robust to one bad sensor
+  summarise(sap_mid = median(sap_mid), sap_sum = median(sap_sum), .groups = "drop")
+
+# MODIS GPP (MOD17A2HGF, 500 m pixel). Each value is an 8-day composite, so each day
+# takes the value of the composite it belongs to (no interpolation between composites).
+# Values above 32760 are MODIS fill codes; scale 0.0001 kg C m-2 per 8 days -> g C m-2 d-1.
+gpp_file     <- "modis_gpp_OWC_8day_2024_2025.rds"   # dated at the composite start
+gpp_file_old <- "modis_gpp_OWC_2024_2025.rds"        # earlier download, dated at the midpoint (start + 4 d)
+
+if (!file.exists(gpp_file) && file.exists(gpp_file_old)) {
+  readRDS(gpp_file_old) %>% mutate(DATE = DATE - 4) %>% saveRDS(gpp_file)   # reuse, no new download
+}
+if (!file.exists(gpp_file)) {
+  mt_subset(product = "MOD17A2HGF", band = "Gpp_500m", lat = site_lat, lon = site_lon,
+            start = as.character(data_start - 40), end = as.character(data_end),
+            km_lr = 0, km_ab = 0, site_name = "OWC", internal = TRUE, progress = FALSE) %>%
+    transmute(DATE = as_date(calendar_date),
+              gpp  = if_else(value > 32760, NA_real_, value * 0.0001 * 1000 / 8)) %>%
+    saveRDS(gpp_file)
+}
+
+# Daily driver table. Starts 40 days before the wells so the 30-day windows are
+# complete at the start of the record. Rain windows are sums of complete windows only;
+# sap flux and GPP windows are means of the measured days (>= 80% of the window).
+drivers_all <- tibble(DATE = seq(data_start - 40, data_end, by = "day")) %>%
+  left_join(met_daily, by = "DATE") %>%
+  left_join(lake_d, by = "DATE") %>%
+  left_join(sap_d, by = "DATE") %>%
+  left_join(readRDS(gpp_file), by = "DATE") %>%
+  tidyr::fill(gpp, .direction = "down") %>%
+  mutate(rain_7d   = roll_sum_obs(rain, 7),
+         rain_30d  = roll_sum_obs(rain, 30),
+         sap_cum30 = roll_mean_obs(sap_mid, 30),
+         gpp_cum30 = roll_mean_obs(gpp, 30))
+```
+
+# Standing transpiration
+```{r}
+# Stand transpiration of the TR plot (mm d-1): sap flux density scaled by sapwood area.
+# Placed right after "Drivers": it adds E_mm and E_mean30 to drivers_all, so the later
+# chunks can use transpiration in water units, not only the standardized proxy.
+#
+# Steps: (1) sapwood area of every live tree in the plot (2024 census); (2) daily sap flux
+# density as the median of the sensors; (3) stand transpiration = flux density x sapwood
+# area per ground area. Only measured days are used (no gap filling).
+#
+# Assumptions to state in Methods:
+#   - All trees in the TR plot are treated as oaks (Quercus); the inventory has no species,
+#     so the oak sapwood allometry and the oak sap flux sensors represent the whole stand.
+#   - F is Granier sap flux density in cm3 cm-2 s-1 (0.0119 * K^1.231); change f_to_cm_s otherwise.
+#   - No radial or probe-in-heartwood correction (Clearwater et al. 1999). Oak sapwood here
+#     (16-47 mm) is often thinner than the probe, so E is likely underestimated (lower bound).
+
+plot_area_m2 <- 625                    # TR inventory plot area (m2): confirm
+f_to_cm_s    <- 1                     # multiplier converting F to cm3 cm-2 s-1
+dead_codes   <- c("D", "DS", "DN")    # Status_2024 codes of dead trees (LI = live)
+
+# (1a) Oak sapwood allometry from the cores. Sapwood area is the outer ring of the stem,
+# pi * (r^2 - (r - s)^2), with r = DBH / 2 and s = sapwood depth.
+ring_area_cm2 <- function(dbh_m, depth_mm) {
+  r <- dbh_m * 100 / 2
+  pi * (r^2 - pmax(r - depth_mm / 10, 0)^2)
+}
+
+# The core file has a title line above the header, so the header is found as the first
+# line containing "genus". janitor standardizes names ("DBH (m) field" -> dbh_m_field).
+cores_file <- here::here("bai_data_OWC.csv")
+header_row <- which(str_detect(tolower(readLines(cores_file, warn = FALSE)), "genus"))[1]
+cores <- read_csv(cores_file, skip = header_row - 1, show_col_types = FALSE) %>%
+  janitor::clean_names() %>%
+  transmute(genus,
+            dbh_field_m = readr::parse_number(as.character(dbh_m_field)),     # m
+            sapwood_mm  = readr::parse_number(as.character(sapwood_msmt_mm))) %>% # mm
+  filter(str_detect(genus, regex("^qu", ignore_case = TRUE)), !is.na(dbh_field_m), !is.na(sapwood_mm)) %>%
+  mutate(sapwood_cm2 = ring_area_cm2(dbh_field_m, sapwood_mm))
+oak_allom <- lm(log(sapwood_cm2) ~ log(dbh_field_m * 100), data = cores)
+message(nrow(cores), " oak cores used for the sapwood allometry")
+print(summary(oak_allom)$coefficients)
+
+# (1b) Sapwood area of every live tree in the plot. All columns are read as text because
+# read_csv guesses types from the first rows and can turn later values into NA.
+inventory <- read_csv(here::here("LE_TreePlotInventory_OWC.csv"),
+                      col_types = cols(.default = col_character())) %>%
+  filter(Site == "OWC", Plot == "TR") %>%
+  transmute(tree_id = Tag, status = Status_2024,
+            dbh_m   = readr::parse_number(DBH_cm_2024) / 100) %>%
+  filter(!is.na(dbh_m), !status %in% dead_codes) %>%
+  mutate(sapwood_cm2 = exp(predict(oak_allom, newdata = data.frame(dbh_field_m = dbh_m))))
+
+# Sapwood area per ground area. Forests usually have ~5-40 cm2 m-2; a much larger value
+# points to a wrong plot area.
+as_ag_cm2_per_m2 <- sum(inventory$sapwood_cm2) / plot_area_m2
+message(nrow(inventory), " live trees | sapwood area per ground area: ", round(as_ag_cm2_per_m2, 1), " cm2 m-2",
+        if (as_ag_cm2_per_m2 > 60) " -> unusually high, check plot_area_m2" else "")
+
+# (2) Daily sap flux density per sensor, complete days only (>= 20 measured hours), then
+# the median across sensors. df_sap_OWC already has the unreliable periods removed.
+js_daily <- df_sap_OWC %>%
+  filter(!is.na(F), F < sap_max) %>%
+  group_by(DATE = as_date(datetime), Sensor_ID) %>%
+  summarise(js = sum(F * f_to_cm_s) * 3600, n_hours = n(), .groups = "drop") %>%   # cm3 cm-2 d-1
+  filter(n_hours >= 20) %>%
+  group_by(DATE) %>%
+  summarise(js = median(js), n_sensors = n(), .groups = "drop")
+
+# (3) Stand transpiration. Sapwood per ground area / 1e4 -> cm2 cm-2; 1 cm3 of water per
+# cm2 of ground = 10 mm.
+E_stand <- js_daily %>%
+  transmute(DATE, E_mm = js * as_ag_cm2_per_m2 / 1e4 * 10, n_sensors)
+
+E_stand %>%
+  filter(DATE >= leafon_start, DATE <= leafon_end) %>%
+  summarise(days_measured = n(), E_mean_mm_d = mean(E_mm),
+            E_p10 = quantile(E_mm, 0.1), E_p90 = quantile(E_mm, 0.9)) %>%
+  print()
+
+# Add to the driver table: daily E and its 30-day mean (measured days only, >= 80% of the window).
+drivers_all <- drivers_all %>%
+  dplyr::select(-any_of(c("E_mm", "E_mean30"))) %>%
+  left_join(E_stand %>% dplyr::select(DATE, E_mm), by = "DATE") %>%
+  mutate(E_mean30 = roll_mean_obs(E_mm, 30))
+```
+
+# Water level in the TR, WTE, e W
+```{r}
+# COMPASS L2 water-level files (parquet), one per plot, year and variable.
+files <- list.files("D:/COMPASS_L2-v2-1", recursive = TRUE, full.names = TRUE,
+                    pattern = "^OWC_(TR|W|WTE)_(2024|2025)_(gw-pressure-vented|gw-density).*parquet$")
+message(length(files), " well files")
+
+# Well geometry (copy of the COMPASS Google Sheet in the repository).
+# Sensor depth below the ground = ring-to-sensor length minus the well stick-up above the ground.
+well_dimensions <- read_csv(here::here("well_dimensions.csv"), show_col_types = FALSE) %>%
+  transmute(Site = site,
+            Plot = case_when(transect_location == "Upland"     ~ "UP",
+                             transect_location == "Transition" ~ "TR",
+                             transect_location == "WTE"        ~ "WTE",
+                             transect_location == "Wetland"    ~ "W"),
+            ground_to_sensor_cm = ring_to_pressure_sensor_cm - (well_top_to_ground_cm - bolt_to_cap_cm))
+
+# Water level relative to the ground surface (negative = below ground).
+# Pressure (mbar) -> water column (m) using the measured water density; densities
+# below 0.95 g cm-3 are not physical for water and are replaced by 1.
+dat_L1_hour <- purrr::map_dfr(files, arrow::read_parquet) %>%
+  group_by(TIMESTAMP, Site, Plot, research_name) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%   # one value per timestamp
+  pivot_wider(names_from = research_name, values_from = Value) %>%
+  left_join(well_dimensions, by = c("Site", "Plot")) %>%
+  mutate(density = if_else(`gw-density` > 0.95, `gw-density`, 1),
+         wl_below_surface_m = (`gw-pressure-vented` * 100) / (density * 1000 * 9.80665) -
+           ground_to_sensor_cm / 100) %>%
+  filter(as_date(TIMESTAMP) >= data_start, as_date(TIMESTAMP) < data_end) %>%
+  dplyr::select(TIMESTAMP, Plot, wl_below_surface_m)
+
+# Barrier beach open periods (OWC NERR daily log). When open, the estuary drains to the lake.
+barrier_open <- tibble::tribble(
+  ~start,       ~end,
+  "2024-04-01", "2024-04-25",
+  "2024-04-30", "2024-05-07",
+  "2024-05-18", "2024-05-26",
+  "2024-06-06", "2024-06-07",
+  "2024-07-08", "2024-07-09",
+  "2024-12-11", "2025-03-26",
+  "2025-03-28", "2025-04-30",
+  "2025-05-04", "2025-05-14") %>%
+  mutate(xmin = as.POSIXct(start, tz = lubridate::tz(dat_L1_hour$TIMESTAMP)),          # for the figure
+         xmax = as.POSIXct(end,   tz = lubridate::tz(dat_L1_hour$TIMESTAMP)) + days(1))
+
+barrier_days <- barrier_open %>%                                                       # one row per open day
+  reframe(DATE = seq(as.Date(start), as.Date(end), by = "day"), .by = start) %>%
+  distinct(DATE) %>%
+  mutate(barrier = "open")
+
+fig_wells <- ggplot(dat_L1_hour, aes(TIMESTAMP, wl_below_surface_m, colour = Plot)) +
+  geom_rect(data = barrier_open, inherit.aes = FALSE,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf), fill = "skyblue", alpha = 0.25) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_point(size = 0.6) +
+  scale_colour_manual(values = well_colors) +
+  labs(x = NULL, y = "Water level relative to ground surface (m)", colour = NULL,
+       caption = "Shaded: barrier beach open") +
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 14))
+print(fig_wells)
+
+# Daily mean water level per well (one column per well), with every day present
+# so lagged differences in the water-balance model refer to consecutive days.
+wells_daily <- dat_L1_hour %>%
+  group_by(DATE = as_date(TIMESTAMP), Plot) %>%
+  summarise(wl = mean(wl_below_surface_m, na.rm = TRUE), .groups = "drop") %>%
+  mutate(wl = if_else(is.finite(wl), wl, NA_real_)) %>%
+  pivot_wider(names_from = Plot, values_from = wl) %>%
+  tidyr::complete(DATE = seq(data_start, data_end - 1, by = "day")) %>%
+  left_join(barrier_days, by = "DATE") %>%
+  mutate(barrier = factor(coalesce(barrier, "closed"), levels = c("open", "closed")))
+```
+
+
+# TR water-balance model for gap filling gwl <0.5m (supplementary)
+
+```{r}
+# Daily water balance of the shallow aquifer under TR, used to estimate the TR GW 
+# level on days when it was below the sensor (censored) or missing:
+#
+#   dTR_t = a * rain_t - b * (TR_{t-1} - WTE_{t-1}) - c * ET_t + d
+#
+# a = rise per mm of rain (its inverse is the specific yield); b = lateral exchange with
+# the downslope well (Darcy: flow proportional to the head difference); c = drawdown per
+# unit of the transpiration proxy; d = constant. The unknown ground-elevation difference
+# between the wells is constant, so it is absorbed by d and no survey is needed.
+
+et_proxy      <- "gpp"   # GPP covers Nov-Jan; sap flux is missing there
+exchange_with <- "WTE"   # nearest downslope well
+n_sims        <- 500     # ensemble size for the uncertainty interval
+res_block     <- 7       # residuals are resampled in 7-day blocks to keep their autocorrelation
+set.seed(42)
+
+# Daily table. tr_obs marks days with TR above its sensor (a real measurement).
+# The head difference uses the previous day, because flow on day t depends on the
+# gradient at the start of the day.
+wb_daily <- wells_daily %>%
+  left_join(met_daily %>% dplyr::select(DATE, rain), by = "DATE") %>%
+  left_join(drivers_all %>% dplyr::select(DATE, sap_mid, gpp), by = "DATE") %>%
+  mutate(down      = .data[[exchange_with]],
+         et        = .data[[et_proxy]],
+         tr_obs    = !is.na(TR) & TR > tr_floor,
+         dTR       = TR - lag(TR),
+         grad_prev = lag(TR) - lag(down),
+         fit_ok    = tr_obs & lag(tr_obs))   # daily change only when both days were measured
+
+# Fit on measured changes only. m_hydro (rain + exchange) and m_full (+ transpiration
+# proxy) are compared to see whether the proxy adds information to the daily balance.
+fit_df  <- wb_daily %>% filter(fit_ok, !is.na(rain), !is.na(grad_prev), !is.na(et))
+m_hydro <- lm(dTR ~ rain + grad_prev, data = fit_df)
+m_full  <- lm(dTR ~ rain + grad_prev + et, data = fit_df)
+
+cat("Fitting days:", nrow(fit_df), "|", format(min(fit_df$DATE)), "to", format(max(fit_df$DATE)), "\n")
+print(summary(m_full)$coefficients)
+print(anova(m_hydro, m_full))
+
+# Physical check of the fitted coefficients: specific yield (rise of a per mm of rain),
+# time to equilibrate with the downslope well, and the ground-elevation difference implied by d.
+cf <- coef(m_full)
+tibble(specific_yield           = 0.001 / cf[["rain"]],
+       exchange_time_days       = -1 / cf[["grad_prev"]],
+       implied_dz_TR_minus_WTE_m = cf[["(Intercept)"]] / cf[["grad_prev"]]) %>%
+  print()
+
+# Forward simulation: on measured days the series restarts from the observation;
+# on censored or missing days it is advanced with the water balance. Days without
+# rain or downslope data keep the previous value.
+simulate_tr <- function(df, cf, noise = rep(0, nrow(df))) {
+  a <- cf[["rain"]]; b <- -cf[["grad_prev"]]; d <- cf[["(Intercept)"]]
+  c_et <- if ("et" %in% names(cf)) -cf[["et"]] else 0
+  sim <- rep(NA_real_, nrow(df))
+  for (i in seq_len(nrow(df))) {
+    if (df$tr_obs[i]) { sim[i] <- df$TR[i]; next }
+    if (i == 1 || is.na(sim[i - 1])) next
+    if (anyNA(c(df$rain[i], df$down[i - 1]))) { sim[i] <- sim[i - 1]; next }
+    et_i <- if (is.na(df$et[i])) 0 else df$et[i]
+    sim[i] <- sim[i - 1] + a * df$rain[i] - b * (sim[i - 1] - df$down[i - 1]) - c_et * et_i + d + noise[i]
+  }
+  sim
+}
+
+# Uncertainty: each run draws the coefficients from their estimated covariance (parameter
+# uncertainty) and adds resampled daily residuals (process uncertainty), so the interval
+# widens with the time since the last measurement.
+block_noise <- function(res, n, block) {
+  starts <- sample(seq_len(length(res) - block + 1), ceiling(n / block), replace = TRUE)
+  unlist(lapply(starts, function(s) res[s:(s + block - 1)]))[seq_len(n)]
+}
+cf_draws <- MASS::mvrnorm(n_sims, coef(m_full), vcov(m_full))
+ens <- vapply(seq_len(n_sims), function(k)
+  simulate_tr(wb_daily, cf_draws[k, ], noise = block_noise(residuals(m_full), nrow(wb_daily), res_block)),
+  numeric(nrow(wb_daily)))
+
+# On censored days the water level is known to be at or below the sensor, so values
+# above the floor are capped. Sensor gaps (no reading at all) are not capped.
+censored_days <- !is.na(wb_daily$TR) & !wb_daily$tr_obs
+p_above <- rowMeans(ens > tr_floor, na.rm = TRUE)     # share of runs above the floor
+ens[censored_days, ] <- pmin(ens[censored_days, ], tr_floor)
+q <- apply(ens, 1, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+
+# Gap-filled series with flags: status of each day, median and 95% interval of the
+# ensemble, whether the model wanted to put TR above the sensor (capped), whether the
+# drivers were outside the range used to fit the model (out_of_range), and days since
+# the last measurement.
+rng <- function(x) range(x, na.rm = TRUE)
+tr_filled <- wb_daily %>%
+  dplyr::select(DATE, TR, tr_obs, rain, et, down) %>%
+  mutate(status   = case_when(tr_obs ~ "observed",
+                              !is.na(TR) ~ "censored (below sensor)",
+                              TRUE ~ "missing (sensor gap)"),
+         filled   = !tr_obs,
+         TR_best  = if_else(tr_obs, TR, q[2, ]),
+         TR_lwr   = if_else(tr_obs, TR, q[1, ]),
+         TR_upr   = if_else(tr_obs, TR, q[3, ]),
+         ci_width = TR_upr - TR_lwr,
+         capped   = status == "censored (below sensor)" & p_above > 0.5,
+         grad_sim = lag(TR_best) - lag(down),
+         out_of_range = filled & (grad_sim < rng(fit_df$grad_prev)[1] | grad_sim > rng(fit_df$grad_prev)[2] |
+                                  (!is.na(et) & (et < rng(fit_df$et)[1] | et > rng(fit_df$et)[2])) |
+                                  rain > rng(fit_df$rain)[2])) %>%
+  group_by(obs_grp = cumsum(tr_obs)) %>%
+  mutate(days_since_obs = if_else(obs_grp == 0, NA_real_, as.numeric(row_number() - 1))) %>%
+  ungroup() %>%
+  dplyr::select(-obs_grp, -grad_sim)
+
+# How much of the study period is filled, how much is extrapolated, and how uncertain.
+study <- tr_filled %>% filter(DATE >= win_start, DATE <= win_end)
+study %>%
+  summarise(n_days             = n(),
+            pct_observed       = round(100 * mean(status == "observed"), 1),
+            pct_censored       = round(100 * mean(status == "censored (below sensor)"), 1),
+            pct_missing        = round(100 * mean(status == "missing (sensor gap)"), 1),
+            pct_out_of_range   = round(100 * mean(out_of_range, na.rm = TRUE), 1),
+            pct_capped         = round(100 * mean(capped, na.rm = TRUE), 1),
+            median_ci_width_m  = round(median(ci_width[filled], na.rm = TRUE), 3),
+            max_days_since_obs = max(days_since_obs, na.rm = TRUE)) %>%
+  print(width = Inf)
+
+study %>%
+  group_by(month = floor_date(DATE, "month")) %>%
+  summarise(pct_filled       = round(100 * mean(filled)),
+            pct_out_of_range = round(100 * mean(out_of_range, na.rm = TRUE)),
+            pct_capped       = round(100 * mean(capped, na.rm = TRUE)),
+            TR_best_median   = round(median(TR_best, na.rm = TRUE), 2),
+            ci_width_median  = round(median(ci_width[filled], na.rm = TRUE), 3), .groups = "drop") %>%
+  print(n = Inf)
+
+fig_fill <- ggplot(tr_filled, aes(DATE)) +
+  geom_rect(data = barrier_open, inherit.aes = FALSE,
+            aes(xmin = as.Date(start), xmax = as.Date(end) + 1, ymin = -Inf, ymax = Inf),
+            fill = "skyblue", alpha = 0.25) +
+  annotate("rect", xmin = leafon_start, xmax = leafon_end, ymin = -Inf, ymax = Inf,
+           fill = "#7AD151FF", alpha = 0.06) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_hline(yintercept = tr_floor, colour = "#7AD151FF", linetype = "dotted") +
+  geom_line(data = wells_daily, aes(y = W,   colour = "W"),   linewidth = 0.5) +
+  geom_line(data = wells_daily, aes(y = WTE, colour = "WTE"), linewidth = 0.5) +
+  geom_ribbon(aes(ymin = if_else(filled, TR_lwr, NA_real_), ymax = if_else(filled, TR_upr, NA_real_)),
+              fill = "grey40", alpha = 0.3) +
+  geom_line(aes(y = if_else(filled, TR_best, NA_real_)), colour = "black", linewidth = 0.7) +
+  geom_point(aes(y = if_else(tr_obs, TR, NA_real_), colour = "TR"), size = 0.9) +
+  geom_point(data = filter(tr_filled, out_of_range), aes(y = TR_best),
+             shape = 4, size = 1.2, colour = "firebrick") +
+  scale_colour_manual(values = well_colors) +
+  labs(x = NULL, y = "Water level relative to ground surface (m)", colour = NULL,
+       caption = paste("TR filled: black line and grey band (median and 95% interval of", n_sims,
+                       "runs); red x: drivers outside the fitted range; blue: barrier open; green: leaf-on")) +
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 14))
+print(fig_fill)
+ggsave("fig_TR_gapfilled.png", fig_fill, width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+
+# Transpiration vs water table: random forest partition (supplementary)
+
+```{r}
+# Random-forest partition of transpiration vs external hydrology (supplementary).
+# Ben suggestion: quantify how much of the variation in the water table, soil moisture
+# and CH4 is explained by transpiration and how much by external hydrology.
+#
+# Transpiration is represented only by its proxies (TR sap flux, MODIS GPP, plus VPD).
+# External hydrology: rain, Lake Erie level, estuary water level (W well) and the TR water table.
+#
+# Method used for every question: random forests evaluated with blocked cross-validation
+# (each 14-day block is predicted by a model trained without it, so autocorrelated
+# neighbouring days never predict themselves). The cross-validated R2 is then split into
+# the part only transpiration explains, the part only hydrology explains, and the part
+# either can explain (shared, i.e. they vary together over the season).
+#
+# The TR water table enters in two versions: "filled" (gap-filled by the water-balance
+# model; main) and "censored" (observed values capped at the sensor plus a flag for
+# below-sensor days; sensitivity). The GPP term was not significant in the water-balance
+# model, so the filled series contains little GPP information; comparing both versions
+# checks that gap filling does not drive the results.
+
+wt_versions <- c("filled", "censored")
+
+# Daily water-table variables. dgwl_obs uses measured days only: simulated changes
+# contain the model's own terms and cannot be used to test what drives the water table.
+wt_daily <- tr_filled %>%
+  dplyr::select(DATE, TR_obs = TR, tr_obs, status, gwl_fill = TR_best) %>%
+  left_join(wells_daily %>% dplyr::select(DATE, W), by = "DATE") %>%
+  mutate(gw_below  = as.integer(status == "censored (below sensor)"),
+         gwl_cens  = if_else(is.na(TR_obs), NA_real_, pmax(TR_obs, tr_floor)),
+         dgwl_obs  = if_else(tr_obs & lag(tr_obs), TR_obs - lag(TR_obs), NA_real_),
+         dgwl_fill = gwl_fill - lag(gwl_fill),
+         dgwl_cens = gwl_cens - lag(gwl_cens),
+         dW        = W - lag(W))
+
+drivers_wt <- drivers_all %>% left_join(wt_daily, by = "DATE")
+
+# One value per treatment and day (median across the four ports), study period only.
+resp_daily <- swc_daily %>%
+  group_by(DATE, Treat) %>%
+  summarise(swc = median(swc), .groups = "drop") %>%
+  full_join(ch4_all %>%
+              group_by(DATE, Treat) %>%
+              summarise(fch4 = median(fch4), ts = median(ts), .groups = "drop"),
+            by = c("DATE", "Treat")) %>%
+  left_join(drivers_wt, by = "DATE") %>%
+  filter(DATE >= win_start, DATE <= win_end)
+
+# How strongly the transpiration proxies covary with the water table (reported in Methods):
+# high correlations are why part of the variance cannot be attributed to either driver.
+drivers_wt %>%
+  filter(DATE >= win_start, DATE <= win_end) %>%
+  summarise(r_sapcum_gwlfill = cor(sap_cum30, gwl_fill, use = "complete.obs"),
+            r_gppcum_gwlfill = cor(gpp_cum30, gwl_fill, use = "complete.obs"),
+            r_sapcum_gwlcens = cor(sap_cum30, gwl_cens, use = "complete.obs"),
+            r_gppcum_gwlcens = cor(gpp_cum30, gwl_cens, use = "complete.obs"),
+            r_sap_gpp        = cor(sap_mid, gpp, use = "complete.obs")) %>%
+  print()
+
+# Predictor groups. Water-table levels explain levels (SWC, CH4); water-table changes
+# explain day-to-day changes (Q2b).
+hydro_level  <- list(filled   = c("gwl_fill", "W", "rain_7d", "rain_30d", "lake"),
+                     censored = c("gwl_cens", "gw_below", "W", "rain_7d", "rain_30d", "lake"))
+hydro_change <- list(filled   = c("gwl_fill", "dgwl_fill", "dW", "rain_7d", "lake_change"),
+                     censored = c("gwl_cens", "dgwl_cens", "gw_below", "dW", "rain_7d", "lake_change"))
+proxies <- list("Sap flux"  = list(day = "sap_mid", cum = "sap_cum30"),
+                "MODIS GPP" = list(day = "gpp",     cum = "gpp_cum30"))
+
+# Blocked cross-validated R2 of a random forest; predictions worse than the mean count as 0.
+cv_r2 <- function(d, response, preds) {
+  folds <- as.integer(as.numeric(d$DATE - min(d$DATE)) %/% cv_block_days)
+  pred  <- rep(NA_real_, nrow(d))
+  for (f in unique(folds)) {
+    train <- folds != f
+    fit <- ranger::ranger(x = d[train, preds, drop = FALSE], y = d[[response]][train],
+                          num.trees = n_trees, seed = 42)
+    pred[!train] <- predict(fit, data = d[!train, preds, drop = FALSE])$predictions
+  }
+  obs <- d[[response]]
+  max(0, 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2))
+}
+
+# Commonality partition: R2 with all predictors, without transpiration, without hydrology
+# and with covariates only (all on the same days). Unique = R2 lost when a group is
+# removed; shared = what either group explains alone; can be negative (suppression).
+partition <- function(df, response, transp, hydro, base = character(0), label) {
+  d <- df %>%
+    dplyr::select(DATE, all_of(c(response, transp, hydro, base))) %>%
+    tidyr::drop_na() %>%
+    arrange(DATE) %>%
+    as.data.frame()
+  r2 <- function(p) if (length(p) == 0) 0 else cv_r2(d, response, p)
+  full <- r2(c(transp, hydro, base)); no_transp <- r2(c(hydro, base))
+  no_hydro <- r2(c(transp, base));     only_base <- r2(base)
+  tibble(model = label, response = response, n_days = nrow(d),
+         r2_full = full, unique_transp = full - no_transp, unique_hydro = full - no_hydro,
+         shared = no_transp + no_hydro - only_base - full, covariates = only_base)
+}
+
+# Direction and size of effects: standardized GLS with temporal autocorrelation (CAR1).
+gls_std <- function(d, resp, terms, label) {
+  d <- d %>% dplyr::select(DATE, y = all_of(resp), all_of(terms)) %>% tidyr::drop_na() %>%
+    mutate(across(all_of(terms), z), day_num = as.numeric(DATE - min(DATE)))
+  m <- nlme::gls(reformulate(terms, "y"), correlation = nlme::corCAR1(form = ~ day_num),
+                 data = d, control = nlme::glsControl(opt = "optim"))
+  as.data.frame(summary(m)$tTable) %>% tibble::rownames_to_column("term") %>%
+    filter(term != "(Intercept)") %>%
+    transmute(model = label, term, estimate_per_sd = Value, se = Std.Error, p = `p-value`, n = nrow(d))
+}
+
+# Q1. Are daily changes in the TR water table driven by transpiration or by external hydrology?
+# Response: measured day-to-day change of the TR water level (days above the sensor).
+# Transpiration group: same-day proxy + VPD. Hydrology group: rain (day and 7 d),
+# change in lake level and change in estuary level.
+q1_df <- drivers_wt %>% filter(DATE >= win_start, DATE <= win_end)
+q1 <- purrr::imap_dfr(proxies, function(p, pname)
+  partition(q1_df, "dgwl_obs", transp = c(p$day, "vpd_max"),
+            hydro = c("rain", "rain_7d", "lake_change", "dW"),
+            label = paste("Water-level change |", pname)))
+q1_coef <- purrr::imap_dfr(proxies, function(p, pname)
+  gls_std(q1_df, "dgwl_obs", c(p$day, "rain", "lake_change", "dW"), paste("Water-level change |", pname)))
+print(q1_coef)
+
+# Q2. Is soil moisture explained by transpiration or by the water table?
+# Response: daily SWC per treatment. Transpiration enters as the 30-day mean proxy
+# (soil water is a store, depleted over weeks) plus the same-day proxy and VPD.
+grid <- tidyr::expand_grid(pname = names(proxies), trt = c("Control", "Root-free"), wt = wt_versions)
+q2 <- purrr::pmap_dfr(grid, function(pname, trt, wt) {
+  p <- proxies[[pname]]
+  partition(filter(resp_daily, Treat == trt), "swc",
+            transp = c(p$cum, p$day, "vpd_max"), hydro = hydro_level[[wt]],
+            label = paste("SWC", trt, "|", pname, "| WT", wt))
+})
+
+# Q2b. On rain-free days, does soil moisture fall faster when trees transpire more?
+# Day-to-day changes remove the seasonal trend that transpiration and the water table share.
+dry_dates <- drivers_all %>% filter(rain < rain_min_mm, lag(rain) < rain_min_mm) %>% pull(DATE)
+resp_change <- resp_daily %>%
+  group_by(Treat) %>%
+  arrange(DATE, .by_group = TRUE) %>%
+  mutate(dswc = if_else(as.numeric(DATE - lag(DATE)) == 1, swc - lag(swc), NA_real_)) %>%
+  ungroup() %>%
+  filter(DATE %in% dry_dates)
+
+q2b <- purrr::pmap_dfr(grid, function(pname, trt, wt) {
+  p <- proxies[[pname]]
+  partition(filter(resp_change, Treat == trt), "dswc",
+            transp = c(p$day, "vpd_max"), hydro = hydro_change[[wt]],
+            label = paste("SWC change (dry days)", trt, "|", pname, "| WT", wt))
+})
+q2b_coef <- tidyr::expand_grid(pname = names(proxies), wt = wt_versions) %>%
+  purrr::pmap_dfr(function(pname, wt) {
+    wt_terms <- if (wt == "filled") c("gwl_fill", "dgwl_fill") else c("gwl_cens", "dgwl_cens")
+    gls_std(filter(resp_change, Treat == "Control"), "dswc",
+            c(proxies[[pname]]$day, "vpd_max", wt_terms, "dW"),
+            paste("SWC change Control |", pname, "| WT", wt))
+  })
+print(q2b_coef)
+
+# Q3. How do transpiration and hydrology affect CH4 flux, and does it act through soil moisture?
+# Soil temperature is a covariate in all models. Adding SWC as a covariate tests mediation:
+# if the transpiration and hydrology parts vanish, their effect on CH4 passes through SWC.
+q3 <- tidyr::expand_grid(grid, with_swc = c(FALSE, TRUE)) %>%
+  purrr::pmap_dfr(function(pname, trt, wt, with_swc) {
+    p <- proxies[[pname]]
+    partition(filter(resp_daily, Treat == trt), "fch4",
+              transp = c(p$cum, p$day, "vpd_max"), hydro = hydro_level[[wt]],
+              base = if (with_swc) c("ts", "swc") else "ts",
+              label = paste("CH4", trt, "|", pname, "| WT", wt, if (with_swc) "| + SWC" else ""))
+  })
+
+# Summary table of all partitions
+partition_tbl <- bind_rows(q1, q2, q2b, q3) %>%
+  mutate(wt_version = case_when(grepl("WT filled", model)   ~ "filled",
+                                grepl("WT censored", model) ~ "censored",
+                                TRUE                        ~ "observed changes"),
+         across(c(r2_full, unique_transp, unique_hydro, shared, covariates), ~ round(.x, 3)))
+print(partition_tbl, n = Inf, width = Inf)
+
+# Figure: main version (measured changes for Q1, filled water table for Q2-Q3).
+# Negative components (suppression) are drawn as zero.
+fig_partition <- partition_tbl %>%
+  filter(wt_version != "censored") %>%
+  tidyr::pivot_longer(c(unique_transp, shared, unique_hydro, covariates),
+                      names_to = "component", values_to = "r2") %>%
+  mutate(r2 = pmax(r2, 0),
+         model = sub(" \\| WT filled", "", model),
+         component = factor(component, levels = c("unique_transp", "shared", "unique_hydro", "covariates"),
+                            labels = c("Transpiration (unique)", "Shared", "Hydrology (unique)",
+                                       "Covariates (Ts, SWC)")),
+         response = factor(response, levels = c("dgwl_obs", "swc", "dswc", "fch4"),
+                           labels = c("Water-level change", "Soil moisture",
+                                      "SWC change (dry days)", "CH4 flux"))) %>%
+  ggplot(aes(r2, model, fill = component)) +
+  geom_col(width = 0.7) +
+  facet_grid(response ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_manual(values = c("Transpiration (unique)" = "#7AD151FF", "Shared" = "grey70",
+                               "Hydrology (unique)" = "#2A788EFF", "Covariates (Ts, SWC)" = "#FDE725FF")) +
+  labs(x = bquote("Cross-validated" ~ R^2 ~ "(blocked, 14-day blocks)"), y = NULL, fill = NULL,
+       caption = "Water table: gap-filled TR (sensitivity with censored TR in Table SX)") +
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 13))
+print(fig_partition)
+ggsave("fig_rf_partition_reviewer.png", fig_partition, width = 11, height = 11, dpi = 300, bg = "white")
+
+# Sensitivity: filled vs censored water table, side by side. Similar values mean the
+# conclusions do not depend on gap filling.
+partition_tbl %>%
+  filter(wt_version %in% wt_versions) %>%
+  mutate(model_base = sub(" \\| WT (filled|censored)", "", model)) %>%
+  dplyr::select(model_base, wt_version, r2_full, unique_transp, unique_hydro, shared) %>%
+  tidyr::pivot_wider(names_from = wt_version, values_from = c(r2_full, unique_transp, unique_hydro, shared)) %>%
+  print(n = Inf, width = Inf)
+```
+
+## Water table: transpiration vs external hydrology (censored regression)
+```{r}
+# Q5. Is the seasonal level of the TR water table set by transpiration or by external
+# hydrology, using all days including those below the sensor?
+#
+# The TR water table was below its sensor (-0.49 m) on many leaf-on days. Dropping those
+# days would remove exactly the period of interest, and gap filling would add model
+# assumptions. Censored (Tobit) regression uses them as "at or below -0.49 m".
+# External hydrology: estuary level (W well) and 30-day rain. Transpiration: the leaf-on
+# window, the 30-day mean of sap flux (tree-specific), MODIS GPP and stand transpiration.
+# 30-day mean VPD tests whether the drawdown follows atmospheric demand in general (which
+# also drives soil evaporation and understory transpiration) or water use by the trees.
+# 95% CIs from a 14-day moving-block bootstrap, which keeps the temporal autocorrelation.
+p_load(AER, boot)
+
+n_boot_tobit <- 1000
+peak_start   <- as.Date("2024-07-15")   # peak leaf-on window for the seasonal contrast
+peak_end     <- as.Date("2024-09-15")
+sy           <- 0.001 / coef(m_full)[["rain"]]   # specific yield from the water-balance model
+
+# Daily table. Censored days are set to the floor value; the Tobit model treats them as
+# "at or below". Barrier variables test whether estuary drainage explains the drawdown.
+tob_df <- wb_daily %>%
+  dplyr::select(DATE, TR, W) %>%
+  left_join(drivers_all %>% dplyr::select(DATE, rain_30d, vpd_max, sap_cum30, gpp_cum30, any_of("E_mean30")),
+            by = "DATE") %>%
+  left_join(barrier_days, by = "DATE") %>%
+  mutate(barrier_open_d = as.integer(!is.na(barrier)),
+         open_30d  = zoo::rollapplyr(barrier_open_d, 30, sum, partial = TRUE),
+         vpd_cum30 = roll_mean_obs(vpd_max, 30),
+         leaf      = factor(if_else(DATE >= leafon_start & DATE <= leafon_end, "leaf-on", "leaf-off"),
+                            levels = c("leaf-off", "leaf-on")),
+         TR_c      = pmax(TR, tr_floor)) %>%
+  filter(DATE >= win_start, DATE <= win_end) %>%
+  tidyr::drop_na(TR_c, W, rain_30d) %>%
+  mutate(sap_z = z(sap_cum30), gpp_z = z(gpp_cum30), vpd_z = z(vpd_cum30))
+
+# How the proxies covary with each other and with the estuary (collinearity check).
+tob_df %>%
+  summarise(n_days = n(), n_censored = sum(TR_c <= tr_floor),
+            r_sap_vpd = cor(sap_z, vpd_z, use = "complete.obs"),
+            r_gpp_vpd = cor(gpp_z, vpd_z, use = "complete.obs"),
+            r_sap_W   = cor(sap_z, W,     use = "complete.obs")) %>%
+  print()
+
+# AER::tobit evaluates the call inside the formula's environment, so that environment is
+# pointed to the local data in every fit (otherwise the bootstrap cannot find the data).
+fit_tobit <- function(form, d) {
+  environment(form) <- environment()
+  AER::tobit(form, left = tr_floor, data = d)
+}
+
+tob_boot <- function(form, data, R = n_boot_tobit) {
+  data <- data %>% dplyr::select(DATE, all_of(all.vars(form))) %>% tidyr::drop_na() %>% arrange(DATE)
+  fit  <- fit_tobit(form, data)
+  set.seed(42)
+  bt <- boot::tsboot(data, function(d) coef(fit_tobit(form, d)), R = R, l = 14, sim = "fixed")
+  tibble(term = names(coef(fit)), estimate = unname(coef(fit)),
+         ci_low  = apply(bt$t, 2, quantile, 0.025, na.rm = TRUE),
+         ci_high = apply(bt$t, 2, quantile, 0.975, na.rm = TRUE),
+         n_days = nrow(data), n_censored = sum(data$TR_c <= tr_floor))
+}
+
+# M1-M2: phenology (with and without barrier state). M3-M6: proxies (sap flux is only
+# available Apr-Oct 2024). M7: stand transpiration in its own units (m per mm d-1).
+tob_sap <- filter(tob_df, !is.na(sap_z))
+models <- list(
+  `M1 leaf-on window`    = list(TR_c ~ W * leaf + rain_30d, tob_df),
+  `M2 leaf-on + barrier` = list(TR_c ~ W + leaf + rain_30d + barrier_open_d + open_30d, tob_df),
+  `M3 MODIS GPP`         = list(TR_c ~ W + rain_30d + gpp_z, tob_df),
+  `M4 sap flux`          = list(TR_c ~ W + rain_30d + sap_z, tob_sap),
+  `M5 VPD only`          = list(TR_c ~ W + rain_30d + vpd_z, tob_sap),
+  `M6 sap flux + VPD`    = list(TR_c ~ W + rain_30d + sap_z + vpd_z, tob_sap))
+if ("E_mean30" %in% names(tob_df) && sum(!is.na(tob_df$E_mean30)) > 50) {
+  models$`M7 stand transpiration` <- list(TR_c ~ W + rain_30d + E_mean30, filter(tob_df, !is.na(E_mean30)))
+}
+
+tob_tbl <- purrr::imap_dfr(models, function(m, name) tob_boot(m[[1]], m[[2]]) %>% mutate(model = name)) %>%
+  filter(!term %in% c("(Intercept)", "Log(scale)")) %>%
+  mutate(ci_excludes_0 = sign(ci_low) == sign(ci_high)) %>%
+  relocate(model)
+print(tob_tbl %>% mutate(across(c(estimate, ci_low, ci_high), ~ round(.x, 4))), n = Inf, width = Inf)
+
+# Standardized effects in physical units: 1 SD of each proxy, and the effect per unit.
+tob_tbl %>%
+  inner_join(tibble(term = c("sap_z", "gpp_z", "vpd_z"),
+                    sd = c(sd(tob_sap$sap_cum30, na.rm = TRUE), sd(tob_df$gpp_cum30, na.rm = TRUE),
+                           sd(tob_sap$vpd_cum30, na.rm = TRUE)),
+                    units = c("F units (30-d mean midday sap flux)", "g C m-2 d-1 (30-d mean GPP)",
+                              "kPa (30-d mean daily max VPD)")), by = "term") %>%
+  transmute(model, term, one_sd = signif(sd, 3), units, m_per_unit = signif(estimate / sd, 3),
+            ci_low_unit = signif(ci_low / sd, 3), ci_high_unit = signif(ci_high / sd, 3)) %>%
+  print(width = Inf)
+
+# Leaf-on drawdown expressed as water removed from the shallow aquifer (m x Sy = water depth).
+tob_tbl %>%
+  filter(term == "leafleaf-on") %>%
+  transmute(model, drawdown_m = round(estimate, 3),
+            water_mm = round(estimate * sy * 1000, 1),
+            water_mm_low = round(ci_low * sy * 1000, 1), water_mm_high = round(ci_high * sy * 1000, 1)) %>%
+  print()
+
+# Physical reference for M7 (rough): if a 30-day mean transpiration of 1 mm d-1 (30 mm of
+# water) came entirely from the aquifer, the water table would drop 30 / (Sy * 1000) m.
+# The ratio of the fitted slope to this value approximates the share drawn from the aquifer.
+if ("M7 stand transpiration" %in% tob_tbl$model) {
+  tob_tbl %>%
+    filter(term == "E_mean30") %>%
+    mutate(expected_if_all_from_aquifer = -30 / (sy * 1000),
+           share_from_aquifer = estimate / expected_if_all_from_aquifer) %>%
+    print(width = Inf)
+}
+
+# Contribution of each driver to the seasonal decline (spring vs peak leaf-on):
+# coefficient x centred predictor, averaged over each window.
+decompose_tobit <- function(form, d, transp_var, label) {
+  d  <- d %>% dplyr::select(DATE, all_of(all.vars(form))) %>% tidyr::drop_na()
+  cf <- coef(fit_tobit(form, d))
+  d %>% transmute(DATE,
+                  `External (estuary W)` = cf[["W"]] * (W - mean(W)),
+                  `Rain (30 d)`          = cf[["rain_30d"]] * (rain_30d - mean(rain_30d)),
+                  Transpiration          = cf[[transp_var]] * (.data[[transp_var]] - mean(.data[[transp_var]])),
+                  model = label)
+}
+contrib <- bind_rows(decompose_tobit(TR_c ~ W + rain_30d + sap_z, tob_sap, "sap_z", "Sap flux"),
+                     decompose_tobit(TR_c ~ W + rain_30d + gpp_z, tob_df,  "gpp_z", "MODIS GPP"))
+
+contrib %>%
+  mutate(window = case_when(DATE < leafon_start ~ "spring",
+                            DATE >= peak_start & DATE <= peak_end ~ "peak")) %>%
+  filter(!is.na(window)) %>%
+  tidyr::pivot_longer(c(`External (estuary W)`, `Rain (30 d)`, Transpiration),
+                      names_to = "driver", values_to = "contribution") %>%
+  group_by(model, driver, window) %>%
+  summarise(mean_m = mean(contribution), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = window, values_from = mean_m) %>%
+  mutate(change_m = peak - spring) %>%
+  group_by(model) %>%
+  mutate(share_of_decline_pct = round(100 * pmin(change_m, 0) / sum(pmin(change_m, 0)))) %>%
+  ungroup() %>%
+  print(n = Inf)
+
+fig_contrib <- contrib %>%
+  tidyr::pivot_longer(-c(DATE, model), names_to = "driver", values_to = "contribution") %>%
+  ggplot(aes(DATE, contribution, colour = driver)) +
+  annotate("rect", xmin = leafon_start, xmax = leafon_end, ymin = -Inf, ymax = Inf,
+           fill = "#7AD151FF", alpha = 0.08) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ model, ncol = 1) +
+  scale_colour_manual(values = c("Transpiration" = "#7AD151FF", "Rain (30 d)" = "#2A788EFF",
+                                 "External (estuary W)" = "#440154FF")) +
+  labs(x = NULL, y = "Contribution to TR water-table level (m)", colour = NULL,
+       caption = "Censored (Tobit) regression; green band: leaf-on") +
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 14))
+print(fig_contrib)
+ggsave("fig_TR_driver_contributions.png", fig_contrib, width = 11, height = 7, dpi = 300, bg = "white")
+
+# Leaf-on water balance: minimum water that had to leave the TR system (rain reaching the
+# ground + water lost from the aquifer, at least from ~0 m to the sensor) compared with the
+# measured stand transpiration. Daily means are compared, so unmeasured days are not filled.
+leafon_days <- as.numeric(leafon_end - leafon_start + 1)
+rain_leafon <- sum(drivers_all$rain[drivers_all$DATE >= leafon_start & drivers_all$DATE <= leafon_end],
+                   na.rm = TRUE)
+tibble(interception = c(0.10, 0.20)) %>%
+  mutate(net_rain_mm         = rain_leafon * (1 - interception),
+         aquifer_loss_min_mm = -tr_floor * sy * 1000,
+         required_out_mm_d   = (net_rain_mm + aquifer_loss_min_mm) / leafon_days,
+         stand_E_mm_d        = if (exists("E_stand"))
+           mean(E_stand$E_mm[E_stand$DATE >= leafon_start & E_stand$DATE <= leafon_end]) else NA_real_,
+         ratio_E_to_required = stand_E_mm_d / required_out_mm_d) %>%
+  mutate(across(where(is.double), ~ round(.x, 2))) %>%
+  print()
+```
+
+# Direct test: transpiration proxies vs CH4 by treatment
+
+```{r}
+# Q4. Does CH4 uptake respond to transpiration where roots are present?
+#
+# Hypothesis: in Control plots CH4 uptake increases with transpiration (the flux becomes
+# more negative, so the slope is negative); in Root-free plots CH4 does not follow it.
+# The treatment difference in CH4 is never used as a transpiration measure: transpiration
+# comes only from the measured proxies (sap flux, MODIS GPP, stand transpiration).
+#
+# (a) Slope of CH4 on each proxy within each treatment (daily treatment medians), adjusted
+#     for soil temperature, with continuous-time AR(1) errors for autocorrelation.
+# (b) Within-day contrast: port and day fixed effects. Day effects absorb everything both
+#     treatments share on a given day (season, temperature, water table, estuary, rain),
+#     so the Control x proxy term is only the Control-specific response to transpiration.
+#     95% CIs from a 14-day block bootstrap over days.
+# (c) As (b), adding port-level SWC: if the term shrinks, transpiration acts on CH4
+#     through soil moisture; if it stays, through another root pathway (e.g. aeration,
+#     root exudates).
+# Proxies are standardized (per SD) so they can be compared; the last table converts the
+# Control x proxy term back to physical units.
+n_boot_dfe <- 500
+
+proxy_lab <- c(sap_mid   = "Sap flux (daily midday)",  sap_cum30 = "Sap flux (30-d mean)",
+               gpp       = "MODIS GPP (8-day)",        gpp_cum30 = "MODIS GPP (30-d mean)",
+               E_mean30  = "Stand transpiration (30-d mean)")
+proxy_units <- c(sap_mid = "F units", sap_cum30 = "F units", gpp = "g C m-2 d-1",
+                 gpp_cum30 = "g C m-2 d-1", E_mean30 = "mm d-1")
+proxy_vars <- intersect(names(proxy_lab), names(drivers_wt))   # E_mean30 only if chunk "Stand transpiration" ran
+
+ch4_pd <- ch4_all %>%
+  left_join(drivers_wt %>% dplyr::select(DATE, all_of(proxy_vars)), by = "DATE") %>%
+  filter(DATE >= win_start, DATE <= win_end) %>%
+  mutate(ctrl = as.numeric(Treat == "Control"), PORT = factor(PORT))
+
+# (a) Within-treatment slopes. Spearman rho is reported as an assumption-free check.
+trt_day <- ch4_pd %>%
+  group_by(DATE, Treat) %>%
+  summarise(fch4 = median(fch4), ts = median(ts), swc = median(swc),
+            across(all_of(proxy_vars), dplyr::first), .groups = "drop")
+
+slope_fit <- function(trt, pv) {
+  d <- trt_day %>%
+    filter(Treat == trt) %>%
+    dplyr::select(DATE, fch4, ts, x = all_of(pv)) %>%
+    tidyr::drop_na() %>%
+    arrange(DATE) %>%
+    mutate(x_z = z(x), ts_z = z(ts), day_num = as.numeric(DATE - min(DATE)))
+  m <- tryCatch(nlme::gls(fch4 ~ x_z + ts_z, correlation = nlme::corCAR1(form = ~ day_num),
+                          data = d, control = nlme::glsControl(opt = "optim")),
+                error = function(e) NULL)
+  tt <- if (is.null(m)) matrix(NA, 1, 4, dimnames = list("x_z", c("Value", "Std.Error", "t-value", "p-value")))
+        else summary(m)$tTable
+  tibble(proxy = proxy_lab[[pv]], Treat = trt, n_days = nrow(d),
+         spearman_rho = cor(d$x, d$fch4, method = "spearman"),
+         slope_umol_per_sd = tt["x_z", "Value"], se = tt["x_z", "Std.Error"], p_gls = tt["x_z", "p-value"])
+}
+
+slopes_tbl <- tidyr::expand_grid(trt = c("Control", "Root-free"), pv = proxy_vars) %>%
+  purrr::pmap_dfr(slope_fit) %>%
+  mutate(across(where(is.double), ~ round(.x, 4)))
+print(slopes_tbl, n = Inf, width = Inf)
+
+# (b) and (c) Within-day contrast. The bootstrap resamples 14-day blocks of days; a
+# block drawn twice is kept as separate days so each copy gets its own day effect.
+prep_dfe <- function(pv, data = ch4_pd) {
+  data %>%
+    dplyr::select(DATE, PORT, Treat, ctrl, fch4, ts, swc, x = all_of(pv)) %>%
+    tidyr::drop_na() %>%
+    mutate(x_z = z(x), ts_z = z(ts), swc_z = z(swc), fDATE = factor(DATE))
+}
+
+# No ctrl main effect: it is constant within port and already absorbed by PORT.
+# I() keeps a fixed coefficient name, whatever the term order in the formula.
+dfe_coef <- function(d, with_swc = FALSE) {
+  form <- if (with_swc) fch4 ~ PORT + fDATE + ts_z + I(ctrl * ts_z) + I(ctrl * x_z) + swc_z + I(ctrl * swc_z)
+          else          fch4 ~ PORT + fDATE + ts_z + I(ctrl * ts_z) + I(ctrl * x_z)
+  coef(lm(form, data = d))[["I(ctrl * x_z)"]]
+}
+
+block_boot_days <- function(d, fun, R = n_boot_dfe, block = cv_block_days) {
+  days   <- sort(unique(d$DATE))
+  blocks <- split(days, ceiling(seq_along(days) / block))
+  replicate(R, {
+    pick <- sample(seq_along(blocks), length(blocks), replace = TRUE)
+    db <- purrr::map2_dfr(blocks[pick], seq_along(pick), function(b, i)
+      d %>% filter(DATE %in% b) %>% mutate(fDATE = factor(paste(i, DATE))))
+    fun(db)
+  })
+}
+
+dfe_fit <- function(pv, with_swc) {
+  d   <- prep_dfe(pv)
+  est <- dfe_coef(d, with_swc)
+  set.seed(42)
+  bt <- block_boot_days(d, function(x) dfe_coef(x, with_swc))
+  tibble(proxy = proxy_lab[[pv]], pv = pv,
+         model = if (with_swc) "(c) + SWC (direct effect)" else "(b) total effect",
+         interaction_umol_per_sd = est,
+         ci_low  = quantile(bt, 0.025, na.rm = TRUE),
+         ci_high = quantile(bt, 0.975, na.rm = TRUE),
+         p_boot  = min(1, 2 * min(mean(bt >= 0, na.rm = TRUE), mean(bt <= 0, na.rm = TRUE))),
+         one_sd  = sd(d$x), n_days = n_distinct(d$DATE))
+}
+
+interaction_tbl <- tidyr::expand_grid(pv = proxy_vars, with_swc = c(FALSE, TRUE)) %>%
+  purrr::pmap_dfr(dfe_fit) %>%
+  mutate(ci_excludes_0 = sign(ci_low) == sign(ci_high))
+print(interaction_tbl %>% dplyr::select(-pv, -one_sd) %>% mutate(across(where(is.double), ~ round(.x, 3))),
+      n = Inf, width = Inf)
+
+# Same term in physical units: change in the Control-minus-Root-free CH4 flux per unit of
+# the proxy (dividing by 1 SD of the proxy in the sample used).
+interaction_tbl %>%
+  transmute(proxy, model, one_sd = signif(one_sd, 3), units = proxy_units[pv],
+            umol_per_unit = signif(interaction_umol_per_sd / one_sd, 3),
+            ci_low_unit   = signif(ci_low / one_sd, 3),
+            ci_high_unit  = signif(ci_high / one_sd, 3)) %>%
+  print(n = Inf, width = Inf)
+
+fig_ch4_proxy <- trt_day %>%
+  tidyr::pivot_longer(any_of(c("sap_cum30", "gpp_cum30", "E_mean30")), names_to = "proxy", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(proxy = dplyr::recode(proxy, !!!proxy_lab)) %>%
+  ggplot(aes(value, fch4, colour = Treat)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~ proxy, scales = "free_x") +
+  scale_colour_manual(values = treatment_colors) +
+  labs(x = NULL, y = bquote(CH[4] ~ "flux" ~ (mu*mol ~ m^{-2} ~ s^{-1})), colour = NULL) +
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 14))
+print(fig_ch4_proxy)
+ggsave("fig_ch4_vs_transpiration_proxy.png", fig_ch4_proxy, width = 12, height = 5, dpi = 300, bg = "white")
+```
+
+# Causal tests: randomization, placebo, Granger and window sensitivity
+
+```{r}
+# Q4b. Is the Control-specific response of CH4 to transpiration (chunk "Direct test")
+# robust, or could it arise by chance or from a shared seasonal trend?
+#
+# 1) Randomization (Fisher) test: the interaction is refitted for all 70 ways of calling
+#    4 of the 8 ports "Control". With 8 ports the smallest possible one-sided p is 1/70 = 0.014.
+#    It needs no distributional assumption and respects that the port is the replicate.
+# 2) Placebos that should show no effect: spring leaf-off only (no transpiration yet), and
+#    the proxy 30 days in the future (residualized on today's value, so it carries only
+#    future information; a real effect cannot run backwards in time).
+# 3) Granger-type precedence: do past changes in transpiration predict today's change in
+#    CH4 beyond past CH4 and temperature? The reverse direction is the check. Newey-West
+#    (HAC) errors handle the remaining autocorrelation.
+# 4) Per-port slopes: how many of the 4 Control ports show the negative slope.
+# 5) Window sensitivity: 30 days is a choice, so all pre-set windows (7-60 d) are reported,
+#    for the whole period and from leaf-out, plus one global test across windows that
+#    avoids picking the best window. Windows use measured days only (roll_mean_obs).
+# Needs ch4_pd, trt_day, proxy_lab, prep_dfe() from "Direct test".
+p_load(lmtest, sandwich)
+
+ports       <- levels(ch4_pd$PORT)
+true_ctrl   <- ch4_pd %>% distinct(PORT, ctrl) %>% { setNames(.$ctrl, as.character(.$PORT)) }
+assignments <- purrr::map(combn(ports, 4, simplify = FALSE), ~ setNames(as.numeric(ports %in% .x), ports))
+
+# Point estimate of the Control x proxy term for a given port assignment (same model as (b)).
+interaction_est <- function(d, ctrl_vec) {
+  d$ctrl <- ctrl_vec[as.character(d$PORT)]
+  coef(lm(fch4 ~ PORT + fDATE + ts_z + I(ctrl * ts_z) + I(ctrl * x_z), data = d))[["I(ctrl * x_z)"]]
+}
+
+# Shared randomization helper: stat() maps a port assignment to a number. One-sided p
+# follows H1 (more uptake in Control = more negative); the tolerance absorbs rounding.
+perm_test <- function(stat) {
+  obs  <- stat(true_ctrl)
+  perm <- vapply(assignments, stat, numeric(1))
+  tibble(estimate = obs,
+         p_one_sided = mean(perm <= obs + 1e-12),
+         p_two_sided = mean(abs(perm) >= abs(obs) - 1e-12),
+         rank = sum(perm <= obs + 1e-12), n_assignments = length(perm))
+}
+
+# 1) Randomization test for every proxy.
+rand_tbl <- purrr::map_dfr(names(proxy_lab)[names(proxy_lab) %in% names(ch4_pd)], function(pv) {
+  d <- prep_dfe(pv)
+  perm_test(function(a) interaction_est(d, a)) %>% mutate(proxy = proxy_lab[[pv]], .before = 1)
+}) %>% mutate(across(where(is.double), ~ round(.x, 3)))
+print(rand_tbl, width = Inf)
+
+# 2) Placebos. Too few days or a constant proxy (e.g. no sap data in spring) returns NA.
+placebo_test <- function(pv, type) {
+  d <- if (type == "spring leaf-off") {
+    prep_dfe(pv, filter(ch4_pd, DATE < leafon_start))
+  } else {
+    future <- drivers_wt %>% transmute(DATE = DATE - 30, x_future = .data[[pv]])
+    ch4_pd %>%
+      left_join(future, by = "DATE") %>%
+      dplyr::select(DATE, PORT, fch4, ts, x_now = all_of(pv), x = x_future) %>%
+      tidyr::drop_na() %>%
+      mutate(x_z = z(resid(lm(x ~ x_now))), ts_z = z(ts), fDATE = factor(DATE))
+  }
+  out <- tibble(proxy = proxy_lab[[pv]], placebo = type, n_days = n_distinct(d$DATE))
+  if (nrow(d) < 50 || !is.finite(sd(d$x_z)) || sd(d$x_z) == 0) return(out)
+  bind_cols(out, perm_test(function(a) interaction_est(d, a)))
+}
+placebo_tbl <- tidyr::expand_grid(pv = intersect(c("sap_cum30", "gpp_cum30", "E_mean30"), names(ch4_pd)),
+                                  type = c("spring leaf-off", "proxy 30 d in the future")) %>%
+  purrr::pmap_dfr(placebo_test) %>%
+  mutate(across(where(is.double), ~ round(.x, 3)))
+print(placebo_tbl, width = Inf)
+
+# 3) Granger test on daily changes, per treatment. Missing days stay missing (complete()
+# only inserts the rows), so changes and lags are never computed across gaps.
+granger_hac <- function(trt, pv, reverse, lags = 3) {
+  d <- trt_day %>%
+    filter(Treat == trt) %>%
+    dplyr::select(DATE, fch4, ts, x = all_of(pv)) %>%
+    tidyr::complete(DATE = seq(min(DATE), max(DATE), by = "day")) %>%
+    arrange(DATE) %>%
+    mutate(y = fch4 - dplyr::lag(fch4), xx = x - dplyr::lag(x), dts = ts - dplyr::lag(ts))
+  if (reverse) d <- mutate(d, tmp = y, y = xx, xx = tmp)
+  for (k in seq_len(lags)) d[[paste0("y_l", k)]] <- dplyr::lag(d$y, k)
+  for (k in seq_len(lags)) d[[paste0("x_l", k)]] <- dplyr::lag(d$xx, k)
+  d  <- tidyr::drop_na(d, y, dts, starts_with("y_l"), starts_with("x_l"))
+  m0 <- lm(reformulate(c("dts", paste0("y_l", seq_len(lags))), "y"), data = d)
+  m1 <- update(m0, reformulate(c(".", paste0("x_l", seq_len(lags))), "."))
+  w  <- lmtest::waldtest(m0, m1, vcov = sandwich::NeweyWest(m1, prewhite = FALSE))
+  tibble(Treat = trt, proxy = proxy_lab[[pv]], direction = if (reverse) "CH4 -> proxy" else "proxy -> CH4",
+         n_days = nrow(d), F = w$F[2], p = w$`Pr(>F)`[2])
+}
+# Daily sap flux only: GPP is constant within each 8-day composite, so its daily changes
+# are mostly zero and cannot show day-to-day precedence.
+granger_tbl <- tidyr::expand_grid(trt = c("Control", "Root-free"), pv = "sap_mid", reverse = c(FALSE, TRUE)) %>%
+  purrr::pmap_dfr(granger_hac) %>%
+  mutate(across(where(is.double), ~ round(.x, 3)))
+print(granger_tbl, width = Inf)
+
+# 4) Per-port slopes (temperature-adjusted). The Wilcoxon test is the 4 vs 4 version of
+# the randomization test, easier to report.
+port_slopes <- tidyr::expand_grid(pv = intersect(c("sap_cum30", "gpp_cum30", "E_mean30"), names(ch4_pd)),
+                                  port = ports) %>%
+  purrr::pmap_dfr(function(pv, port) {
+    d <- prep_dfe(pv) %>% filter(PORT == port)
+    tibble(proxy = proxy_lab[[pv]], PORT = port, Treat = as.character(d$Treat[1]),
+           slope_umol_per_sd = coef(lm(fch4 ~ x_z + ts_z, data = d))[["x_z"]], n_days = nrow(d))
+  })
+print(port_slopes %>% arrange(proxy, Treat, PORT), n = Inf)
+
+port_slopes %>%
+  group_by(proxy) %>%
+  summarise(control_negative  = sum(slope_umol_per_sd[Treat == "Control"] < 0),
+            rootfree_negative = sum(slope_umol_per_sd[Treat == "Root-free"] < 0),
+            median_control    = median(slope_umol_per_sd[Treat == "Control"]),
+            median_rootfree   = median(slope_umol_per_sd[Treat == "Root-free"]),
+            p_wilcox = wilcox.test(slope_umol_per_sd ~ Treat, exact = TRUE)$p.value, .groups = "drop") %>%
+  print()
+
+# 5) Window sensitivity. Means over k days of measured values (NA if < 80% of the window
+# was measured). GPP is an 8-day step series, so its windows are always complete.
+windows   <- c(7, 14, 21, 30, 45, 60)
+periods   <- c("full period", "from leaf-out")
+win_proxy <- c(`Sap flux` = "sap_mid", `MODIS GPP` = "gpp")
+
+win_tbl <- drivers_all %>% arrange(DATE) %>% dplyr::select(DATE, all_of(unname(win_proxy)))
+for (p in names(win_proxy)) for (k in windows) {
+  win_tbl[[paste(p, k)]] <- roll_mean_obs(win_tbl[[win_proxy[[p]]]], k)
+}
+
+ch4_win <- ch4_pd %>%
+  dplyr::select(DATE, PORT, Treat, ctrl, fch4, ts, swc) %>%
+  left_join(win_tbl %>% dplyr::select(-all_of(unname(win_proxy))), by = "DATE")
+
+prep_win <- function(proxy, k, period) {
+  dat <- if (period == "from leaf-out") filter(ch4_win, DATE >= leafon_start) else ch4_win
+  dat %>%
+    dplyr::select(DATE, PORT, Treat, fch4, ts, x = all_of(paste(proxy, k))) %>%
+    tidyr::drop_na() %>%
+    mutate(x_z = z(x), ts_z = z(ts), fDATE = factor(DATE))
+}
+
+sens_tbl <- tidyr::expand_grid(proxy = names(win_proxy), k = windows, period = periods) %>%
+  purrr::pmap_dfr(function(proxy, k, period) {
+    d <- prep_win(proxy, k, period)
+    slopes <- d %>% group_by(PORT, Treat) %>%
+      summarise(slope = coef(lm(fch4 ~ x_z + ts_z))[["x_z"]], .groups = "drop")
+    perm_test(function(a) interaction_est(d, a)) %>%
+      mutate(proxy = proxy, window_days = k, period = period, n_days = n_distinct(d$DATE),
+             control_ports_negative  = sum(slopes$slope[slopes$Treat == "Control"] < 0),
+             rootfree_ports_negative = sum(slopes$slope[slopes$Treat == "Root-free"] < 0),
+             .before = 1)
+  }) %>%
+  mutate(across(c(estimate, p_one_sided, p_two_sided), ~ round(.x, 3)))
+print(sens_tbl, n = Inf, width = Inf)
+
+fig_sens <- sens_tbl %>%
+  mutate(sig = if_else(p_one_sided <= 0.05, "p <= 0.05", "p > 0.05")) %>%
+  ggplot(aes(window_days, estimate, colour = proxy)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(shape = sig), size = 3) +
+  facet_wrap(~ period) +
+  scale_shape_manual(values = c("p <= 0.05" = 16, "p > 0.05" = 1)) +
+  scale_colour_manual(values = c("Sap flux" = "#7AD151FF", "MODIS GPP" = "#2A788EFF")) +
+  scale_x_continuous(breaks = windows) +
+  labs(x = "Averaging window (days)",
+       y = bquote("Control x proxy interaction on" ~ CH[4] ~ "(" * mu*mol ~ m^{-2} ~ s^{-1} ~ "per SD)"),
+       colour = NULL, shape = "Randomization test (one-sided)") +
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 13))
+print(fig_sens)
+ggsave("fig_sensitivity_window.png", fig_sens, width = 11, height = 5, dpi = 300, bg = "white")
+
+# Global test: the statistic is the mean interaction across all six windows, so a single
+# p-value covers every window and no window is selected after seeing the results.
+global_tbl <- tidyr::expand_grid(proxy = names(win_proxy), period = periods) %>%
+  purrr::pmap_dfr(function(proxy, period) {
+    d_list <- purrr::map(windows, ~ prep_win(proxy, .x, period))
+    perm_test(function(a) mean(vapply(d_list, interaction_est, numeric(1), ctrl_vec = a))) %>%
+      mutate(proxy = proxy, period = period, .before = 1)
+  }) %>%
+  mutate(across(where(is.double), ~ round(.x, 3)))
+print(global_tbl, width = Inf)
+```
+
+
+# Path analysis (SEM): direct and indirect effects of transpiration on CH4
+
+```{r}
+# Q6. How much of the transpiration effect on CH4 passes through the water table and soil
+# moisture, and does that pathway exist only where roots are present?
+#
+# Why a path model: the predictors depend on each other (transpiration lowers the water
+# table, the water table sets soil moisture, soil moisture sets CH4), so a single regression
+# splits their shared variance arbitrarily. A structural equation model (SEM, lavaan; as in
+# Tang et al. 2025, GCB) writes that dependence explicitly as a chain of regressions and
+# returns, for each response, its R2 and, for each driver, the direct effect, the indirect
+# effect through the mediators and the share of the total effect that is mediated.
+#
+# Assumed causal structure:
+#   water table <- transpiration + rain (30 d and 7 d) + estuary level (W)
+#   SWC         <- transpiration + water table + rain (7 d and 30 d) + soil temperature
+#   CH4         <- SWC + water table + transpiration + soil temperature
+# Paths added after the first fit, following the modification indices and only where
+# physically justified (Tang et al. 2025): recent rain raises the water table (gwl <- rain_7d);
+# antecedent rain keeps the surface soil wet (swc <- rain_30d); warmer soil dries faster by
+# evaporation (swc <- ts). Suggested paths without a mechanism (e.g. water table <- SWC,
+# CH4 <- estuary level) were not added.
+# Multi-group model: the same structure is fitted to Control and Root-free together. The
+# water-table equation is constrained to be equal (both treatments share one water table);
+# the SWC and CH4 paths are free, so the treatments are compared path by path. The
+# treatment difference is never used as a transpiration measure: transpiration comes only
+# from the proxies.
+#
+# Procedure follows Tang et al. (2025): data screening (missing data, skewness, kurtosis,
+# collinearity, residual linearity and homoscedasticity, positive definiteness), robust
+# maximum likelihood (MLR) on standardized variables, and fit judged by CFI, TLI, RMSEA and
+# SRMR (good: CFI and TLI >= 0.95, RMSEA <= 0.06, SRMR <= 0.08). Differences from Tang:
+# daily data with only measured days (no gap filling) and a block bootstrap for the CIs.
+#
+# Limits to report: the structure is assumed, not tested; the TR water table is capped at
+# the sensor (-0.49 m), which weakens the transpiration -> water-table path; daily values
+# are autocorrelated, so CIs come from a 14-day block bootstrap over days, not from lavaan.
+p_load(lavaan, car)
+
+n_boot_sem <- 500
+sem_proxy  <- c(`Sap flux (30-d mean)` = "sap_cum30", `MODIS GPP (30-d mean)` = "gpp_cum30")
+
+sem_model <- '
+  gwl  ~ c(t_wt, t_wt) * transp + rain_30d + rain_7d + W
+  swc  ~ c(t_sw_C, t_sw_R) * transp + c(wt_sw_C, wt_sw_R) * gwl + rain_7d + rain_30d + ts
+  fch4 ~ c(sw_ch_C, sw_ch_R) * swc + c(wt_ch_C, wt_ch_R) * gwl + c(t_ch_C, t_ch_R) * transp + ts
+
+  # Effects of transpiration on CH4, per treatment (C = Control, R = Root-free)
+  via_swc_C    := t_sw_C * sw_ch_C
+  via_swc_R    := t_sw_R * sw_ch_R
+  via_wt_C     := t_wt * (wt_ch_C + wt_sw_C * sw_ch_C)
+  via_wt_R     := t_wt * (wt_ch_R + wt_sw_R * sw_ch_R)
+  indirect_C   := via_swc_C + via_wt_C
+  indirect_R   := via_swc_R + via_wt_R
+  total_C      := t_ch_C + indirect_C
+  total_R      := t_ch_R + indirect_R
+
+  # Root effect on each pathway: Control minus Root-free
+  diff_t_swc    := t_sw_C - t_sw_R
+  diff_wt_swc   := wt_sw_C - wt_sw_R
+  diff_swc_ch4  := sw_ch_C - sw_ch_R
+  diff_indirect := indirect_C - indirect_R
+  diff_total    := total_C - total_R
+  
+  # Total effect of transpiration on SWC (direct + through the water table), per treatment
+  total_sw_C   := t_sw_C + t_wt * wt_sw_C
+  total_sw_R   := t_sw_R + t_wt * wt_sw_R
+  diff_total_sw := total_sw_C - total_sw_R
+'
+
+# Daily table per treatment (median across ports). All variables are standardized over
+# both treatments together, so coefficients are comparable between groups.
+sem_data <- function(pv) {
+  resp_daily %>%
+    transmute(DATE, Treat = factor(Treat, levels = c("Control", "Root-free")),
+              fch4, swc, ts, gwl = gwl_cens, W, rain_7d, rain_30d, transp = .data[[pv]]) %>%
+    tidyr::drop_na() %>%
+    mutate(across(c(fch4, swc, ts, gwl, W, rain_7d, rain_30d, transp), z))
+}
+
+# Data screening (Tang et al. 2025, Supporting Information), per proxy and treatment.
+# The three equations of the model are fitted as ordinary regressions to check them.
+sem_equations <- list(gwl = gwl ~ transp + rain_30d + rain_7d + W,
+                      swc = swc ~ transp + gwl + rain_7d + rain_30d + ts,
+                      fch4 = fch4 ~ swc + gwl + transp + ts)
+sem_vars <- c("fch4", "swc", "ts", "gwl", "W", "rain_7d", "rain_30d", "transp")
+
+screen_sem <- function(pv, proxy_name) {
+  d <- sem_data(pv)
+  # Skewness (|x| > 1 = high) and excess kurtosis (|x| > 2 = too peaked or flat).
+  shape <- d %>%
+    group_by(Treat) %>%
+    summarise(across(all_of(sem_vars), list(
+      skew = ~ mean(.x^3) / mean(.x^2)^1.5,
+      kurt = ~ mean(.x^4) / mean(.x^2)^2 - 3)), .groups = "drop") %>%
+    tidyr::pivot_longer(-Treat, names_to = c("variable", ".value"), names_sep = "_(?=skew|kurt)")
+  # Collinearity: VIF > 10 is extreme. Positive definiteness: all eigenvalues of the
+  # covariance matrix > 0.
+  checks <- d %>%
+    group_by(Treat) %>%
+    group_modify(~ tibble(
+      max_vif = max(unlist(lapply(sem_equations[c("swc", "fch4")], function(f) car::vif(lm(f, data = .x))))),
+      min_eigen = min(eigen(cov(.x[sem_vars]))$values),
+      n_days = nrow(.x))) %>%
+    ungroup()
+  # Residuals vs fitted for each equation (linearity: no curve; homoscedasticity: no funnel).
+  res <- d %>%
+    group_by(Treat) %>%
+    group_modify(~ purrr::imap_dfr(sem_equations, function(f, eq) {
+      m <- lm(f, data = .x); tibble(equation = eq, fitted = fitted(m), resid = resid(m))
+    })) %>%
+    ungroup()
+  print(ggplot(res, aes(fitted, resid)) +
+          geom_point(alpha = 0.4, size = 1) +
+          geom_hline(yintercept = 0, colour = "red") +
+          geom_smooth(method = "loess", formula = y ~ x, se = FALSE, colour = "blue") +
+          facet_grid(Treat ~ equation, scales = "free") +
+          labs(title = paste("Residuals vs fitted:", proxy_name), x = "Fitted", y = "Residual") +
+          theme(panel.grid = element_blank()))
+  cat("\n", proxy_name, "\n")
+  print(shape %>% mutate(across(c(skew, kurt), ~ round(.x, 2))), n = Inf)
+  print(checks %>% mutate(across(where(is.double), ~ round(.x, 3))))
+}
+purrr::iwalk(sem_proxy, screen_sem)
+
+# Robust maximum likelihood (MLR): Huber-White standard errors and a scaled test statistic,
+# because daily fluxes are skewed and residual variance is not constant.
+# lavaan needs a plain data.frame: on a tibble it cannot read the group column and warns
+# that the group labels do not appear. Group order follows the factor levels
+# (1 = Control, 2 = Root-free), which matches the order of the labels in sem_model.
+fit_sem <- function(d) sem(sem_model, data = as.data.frame(d), group = "Treat", estimator = "MLR")
+
+# Block bootstrap over days: the same days are drawn for both treatments, so their
+# shared day-to-day conditions stay paired.
+# Labelled estimates of a fit as a named vector (each label once; shared labels such as
+# t_wt appear in both groups with the same value).
+labelled_est <- function(fit) {
+  pe <- parameterEstimates(fit)
+  x  <- setNames(pe$est, pe$label)
+  x[names(x) != "" & !duplicated(names(x))]
+}
+
+boot_sem <- function(d, R = n_boot_sem) {
+  # Days are kept as text: unlist() on a list of Dates drops the Date class and the
+  # day lookup below would then find no rows.
+  days     <- sort(unique(as.character(d$DATE)))
+  blocks   <- split(days, ceiling(seq_along(days) / cv_block_days))
+  rows_day <- split(seq_len(nrow(d)), as.character(d$DATE))
+  set.seed(42)
+  draws <- replicate(R, {
+    pick <- unlist(blocks[sample(seq_along(blocks), length(blocks), replace = TRUE)])
+    fit  <- tryCatch(suppressWarnings(fit_sem(d[unlist(rows_day[pick]), ])), error = function(e) NULL)
+    if (is.null(fit)) NULL else labelled_est(fit)
+  }, simplify = FALSE)
+  bind_rows(purrr::map(purrr::compact(draws), ~ as_tibble(as.list(.x))))
+}
+
+sem_results <- purrr::imap(sem_proxy, function(pv, proxy_name) {
+  d   <- sem_data(pv)
+  fit <- fit_sem(d)
+  bt  <- boot_sem(d)
+  est <- labelled_est(fit)
+  # Modification indices: the omitted paths that would most improve the fit. Only paths
+  # with a physical justification may be added (Tang et al. 2025).
+  cat("\n", proxy_name, "- largest modification indices\n")
+  print(modindices(fit, sort. = TRUE, maximum.number = 8)[, c("lhs", "op", "rhs", "group", "mi", "epc")])
+  list(
+    n_days = n_distinct(d$DATE),
+    fit    = fitMeasures(fit, c("chisq.scaled", "df.scaled", "pvalue.scaled",
+                                "cfi.robust", "tli.robust", "rmsea.robust", "srmr")),
+    r2     = lavInspect(fit, "r2"),
+    paths  = tibble(proxy = proxy_name, label = names(est), estimate = unname(est),
+                    ci_low  = purrr::map_dbl(names(est), ~ quantile(bt[[.x]], 0.025, na.rm = TRUE)),
+                    ci_high = purrr::map_dbl(names(est), ~ quantile(bt[[.x]], 0.975, na.rm = TRUE)),
+                    n_boot  = nrow(bt)) %>%
+      mutate(ci_excludes_0 = sign(ci_low) == sign(ci_high)))
+})
+
+# Model fit (good: CFI and TLI >= 0.95, RMSEA <= 0.06, SRMR <= 0.08; poor: CFI or TLI < 0.90,
+# RMSEA or SRMR > 0.10; Hu & Bentler 1999) and
+# variance explained (R2) of each response, per treatment.
+purrr::imap(sem_results, function(r, proxy_name) {
+  cat("\n", proxy_name, "| days:", r$n_days, "\n")
+  print(round(r$fit, 3))
+  print(lapply(r$r2, round, 2))
+}) %>% invisible()
+
+# Paths and effects with 95% block-bootstrap CIs (standardized units).
+sem_tbl <- bind_rows(purrr::map(sem_results, "paths")) %>%
+  mutate(across(c(estimate, ci_low, ci_high), ~ round(.x, 3)))
+print(sem_tbl, n = Inf, width = Inf)
+
+# Share of the total transpiration effect on CH4 that is mediated (indirect / total).
+# Only meaningful when the total effect is clearly different from zero.
+sem_tbl %>%
+  filter(label %in% c("indirect_C", "indirect_R", "total_C", "total_R")) %>%
+  mutate(Treat = if_else(str_ends(label, "_C"), "Control", "Root-free"),
+         part  = str_remove(label, "_[CR]$")) %>%
+  dplyr::select(proxy, Treat, part, estimate) %>%
+  tidyr::pivot_wider(names_from = part, values_from = estimate) %>%
+  mutate(pct_mediated = round(100 * indirect / total)) %>%
+  print()
+```
+
+# Path analysis robustness: port randomization and atmospheric demand
+
+```{r}
+# Q6b. Is the SEM result robust to (1) which ports are called Control and (2) atmospheric
+# demand acting on the water table independently of the trees?
+#
+# (1) Port randomization. The SEM uses the daily median of the 4 ports of each treatment,
+# so a treatment difference could come from one unusual port (e.g. the port-6 hot spot)
+# instead of the roots. The SEM is refitted for all 70 ways of calling 4 of the 8 ports
+# "Control"; the observed Control - Root-free difference is ranked among them. With 8
+# ports the smallest possible one-sided p is 1/70 = 0.014 (same logic as "Causal tests").
+# (2) Atmospheric demand. The transpiration proxies rise with vapour pressure deficit, which
+# also drives soil evaporation. VPD (30-d mean of the daily maximum) is added to the water-
+# table and SWC equations; if the transpiration -> water-table path and the treatment
+# difference persist, they are not only atmospheric demand.
+# Needs sem_model, sem_proxy, labelled_est(), fit_sem() from "Path analysis (SEM)".
+
+ports_all  <- sort(unique(as.character(ch4_all$PORT)))
+port_treat <- ch4_all %>% distinct(PORT = as.character(PORT), Treat = as.character(Treat))
+sem_assignments <- combn(ports_all, 4, simplify = FALSE)
+true_control    <- sort(port_treat$PORT[port_treat$Treat == "Control"])
+
+# Port-level daily data (SWC from all valid SWC days, CH4 and soil temperature from the
+# flux days) and the drivers shared by all ports.
+port_daily <- full_join(swc_daily %>% transmute(DATE, PORT = as.character(PORT), swc),
+                        ch4_all  %>% transmute(DATE, PORT = as.character(PORT), fch4, ts),
+                        by = c("DATE", "PORT"))
+sem_drivers <- drivers_all %>%
+  arrange(DATE) %>%
+  mutate(vpd = roll_mean_obs(vpd_max, 30)) %>%
+  dplyr::select(DATE, rain_7d, rain_30d, vpd, all_of(unname(sem_proxy))) %>%
+  left_join(wt_daily %>% dplyr::select(DATE, gwl = gwl_cens, W), by = "DATE") %>%
+  filter(DATE >= win_start, DATE <= win_end)
+
+# Daily medians for a given set of "Control" ports (the rest are "Root-free"), standardized
+# over both groups together, exactly as in the main SEM.
+assign_data <- function(control_ports, pv, extra = character(0)) {
+  port_daily %>%
+    mutate(Treat = factor(if_else(PORT %in% control_ports, "Control", "Root-free"),
+                          levels = c("Control", "Root-free"))) %>%
+    group_by(DATE, Treat) %>%
+    summarise(swc = median(swc, na.rm = TRUE), fch4 = median(fch4, na.rm = TRUE),
+              ts = median(ts, na.rm = TRUE), .groups = "drop") %>%
+    left_join(sem_drivers %>% mutate(transp = .data[[pv]]), by = "DATE") %>%
+    dplyr::select(DATE, Treat, fch4, swc, ts, gwl, W, rain_7d, rain_30d, transp, all_of(extra)) %>%
+    filter(if_all(everything(), ~ !is.na(.x) & !is.nan(.x))) %>%
+    mutate(across(-c(DATE, Treat), z))
+}
+
+perm_sem <- function(pv, proxy_name) {
+  stats <- purrr::map_dfr(sem_assignments, function(a) {
+    fit <- tryCatch(suppressWarnings(fit_sem(assign_data(a, pv))), error = function(e) NULL)
+    est <- if (is.null(fit)) NULL else labelled_est(fit)
+    tibble(control_ports = paste(a, collapse = "-"),
+           is_true = identical(sort(a), true_control),
+           diff_total  = if (is.null(est)) NA_real_ else est[["diff_total"]],
+           diff_wt_swc = if (is.null(est)) NA_real_ else est[["diff_wt_swc"]])
+  })
+  obs <- filter(stats, is_true)
+  # One-sided p in the direction of the hypothesis: more uptake in Control (diff_total < 0)
+  # and stronger water-table -> SWC coupling in Control (diff_wt_swc > 0).
+  tibble(proxy = proxy_name,
+         n_assignments = sum(!is.na(stats$diff_total)),
+         diff_total_obs   = obs$diff_total,
+         p_diff_total     = mean(stats$diff_total <= obs$diff_total + 1e-12, na.rm = TRUE),
+         rank_diff_total  = sum(stats$diff_total <= obs$diff_total + 1e-12, na.rm = TRUE),
+         diff_wt_swc_obs  = obs$diff_wt_swc,
+         p_diff_wt_swc    = mean(stats$diff_wt_swc >= obs$diff_wt_swc - 1e-12, na.rm = TRUE),
+         rank_diff_wt_swc = sum(stats$diff_wt_swc >= obs$diff_wt_swc - 1e-12, na.rm = TRUE))
+}
+
+perm_sem_tbl <- purrr::imap_dfr(sem_proxy, perm_sem) %>%
+  mutate(across(where(is.double), ~ round(.x, 3)))
+print(perm_sem_tbl, width = Inf)
+
+# (2) Same SEM with VPD in the water-table and SWC equations (labels v_wt, v_sw_*).
+sem_model_vpd <- sem_model %>%
+  sub("gwl  ~ c(t_wt, t_wt) * transp +", "gwl  ~ c(t_wt, t_wt) * transp + c(v_wt, v_wt) * vpd +", ., fixed = TRUE) %>%
+  sub("gwl + rain_7d + rain_30d + ts", "gwl + rain_7d + rain_30d + ts + c(v_sw_C, v_sw_R) * vpd", ., fixed = TRUE)
+stopifnot(grepl("v_wt", sem_model_vpd), grepl("v_sw_C", sem_model_vpd))
+
+fit_sem_vpd <- function(d) sem(sem_model_vpd, data = as.data.frame(d), group = "Treat", estimator = "MLR")
+
+boot_sem_vpd <- function(d, R = n_boot_sem) {
+  days     <- sort(unique(as.character(d$DATE)))
+  blocks   <- split(days, ceiling(seq_along(days) / cv_block_days))
+  rows_day <- split(seq_len(nrow(d)), as.character(d$DATE))
+  set.seed(42)
+  draws <- replicate(R, {
+    pick <- unlist(blocks[sample(seq_along(blocks), length(blocks), replace = TRUE)])
+    fit  <- tryCatch(suppressWarnings(fit_sem_vpd(d[unlist(rows_day[pick]), ])), error = function(e) NULL)
+    if (is.null(fit)) NULL else labelled_est(fit)
+  }, simplify = FALSE)
+  bind_rows(purrr::map(purrr::compact(draws), ~ as_tibble(as.list(.x))))
+}
+
+key_terms <- c("t_wt", "v_wt", "wt_sw_C", "wt_sw_R", "total_C", "total_R", "diff_wt_swc", "diff_total")
+vpd_tbl <- purrr::imap_dfr(sem_proxy, function(pv, proxy_name) {
+  d   <- assign_data(true_control, pv, extra = "vpd")
+  fit <- fit_sem_vpd(d)
+  bt  <- boot_sem_vpd(d)
+  est <- labelled_est(fit)[key_terms]
+  cat("\n", proxy_name, "+ VPD | days:", n_distinct(d$DATE), "\n")
+  print(round(fitMeasures(fit, c("cfi.robust", "tli.robust", "rmsea.robust", "srmr")), 3))
+  tibble(proxy = proxy_name, label = key_terms, estimate_with_vpd = unname(est),
+         ci_low  = purrr::map_dbl(key_terms, ~ quantile(bt[[.x]], 0.025, na.rm = TRUE)),
+         ci_high = purrr::map_dbl(key_terms, ~ quantile(bt[[.x]], 0.975, na.rm = TRUE)),
+         n_boot  = nrow(bt))
+}) %>%
+  left_join(sem_tbl %>% dplyr::select(proxy, label, estimate_without_vpd = estimate), by = c("proxy", "label")) %>%
+  mutate(ci_excludes_0 = sign(ci_low) == sign(ci_high),
+         across(where(is.double), ~ round(.x, 3))) %>%
+  relocate(estimate_without_vpd, .after = label)
+print(vpd_tbl, n = Inf, width = Inf)
+```
+
+
+# Path diagram (SEM)
+
+```{r}
+# Path diagram of the SEM in the style of Tang et al. (2025, Fig. 8): one panel per
+# treatment, arrows coloured by sign (blue positive, red negative), width proportional to
+# the standardized coefficient, solid when the 95% block-bootstrap CI excludes zero and
+# dashed grey otherwise. R2 of each response is printed under its box. Rain, estuary level
+# and soil temperature were in the model as covariates and are listed in the caption.
+# Needs sem_tbl and sem_results from "Path analysis (SEM)".
+
+diagram_proxy <- "Sap flux (30-d mean)"   # or "MODIS GPP (30-d mean)"
+
+nodes <- tibble(node = c("Transpiration", "Water table", "SWC", "CH4"),
+                x = c(0, 1.6, 1.6, 3.2), y = c(0, 1, -1, 0),
+                r2_key = c(NA, "gwl", "swc", "fch4"))
+
+edges <- tribble(
+  ~from,           ~to,           ~Control,  ~`Root-free`,
+  "Transpiration", "Water table", "t_wt",    "t_wt",
+  "Transpiration", "SWC",         "t_sw_C",  "t_sw_R",
+  "Water table",   "SWC",         "wt_sw_C", "wt_sw_R",
+  "SWC",           "CH4",         "sw_ch_C", "sw_ch_R",
+  "Water table",   "CH4",         "wt_ch_C", "wt_ch_R",
+  "Transpiration", "CH4",         "t_ch_C",  "t_ch_R") %>%
+  tidyr::pivot_longer(c(Control, `Root-free`), names_to = "Treat", values_to = "label") %>%
+  left_join(filter(sem_tbl, proxy == diagram_proxy), by = "label") %>%
+  left_join(nodes %>% dplyr::select(from = node, x0 = x, y0 = y), by = "from") %>%
+  left_join(nodes %>% dplyr::select(to = node, x1 = x, y1 = y), by = "to") %>%
+  # Shorten each arrow by 22% at both ends so it starts and stops at the box edges.
+  mutate(xs = x0 + 0.22 * (x1 - x0), ys = y0 + 0.22 * (y1 - y0),
+         xe = x1 - 0.22 * (x1 - x0), ye = y1 - 0.22 * (y1 - y0),
+         xm = (x0 + x1) / 2, ym = (y0 + y1) / 2 + if_else(y0 == y1, 0.12, 0),
+         sig    = ci_excludes_0,
+         colour = case_when(!sig ~ "n.s.", estimate > 0 ~ "positive", TRUE ~ "negative"),
+         txt    = sprintf("%.2f", estimate))
+
+node_lab <- tidyr::expand_grid(Treat = c("Control", "Root-free"), nodes) %>%
+  mutate(r2 = purrr::map2_dbl(Treat, r2_key, function(tr, k)
+           if (is.na(k)) NA_real_ else sem_results[[diagram_proxy]]$r2[[tr]][[k]]),
+         lab = if_else(is.na(r2), node, sprintf("%s\nR² = %.2f", node, r2)))
+
+fig_sem <- ggplot() +
+  geom_segment(data = edges,
+               aes(x = xs, y = ys, xend = xe, yend = ye, colour = colour,
+                   linewidth = abs(estimate), linetype = sig),
+               arrow = arrow(length = unit(3, "mm"), type = "closed")) +
+  geom_label(data = edges, aes(xm, ym, label = txt, colour = colour), size = 3.6,
+             label.size = 0, fill = "white", show.legend = FALSE) +
+  geom_label(data = node_lab, aes(x, y, label = lab), size = 4, fill = "grey95",
+             label.padding = unit(0.35, "lines")) +
+  facet_wrap(~ Treat) +
+  scale_colour_manual(values = c(positive = "#2166AC", negative = "#B2182B", `n.s.` = "grey60"),
+                      name = NULL) +
+  scale_linewidth(range = c(0.4, 2.8), guide = "none") +
+  scale_linetype_manual(values = c(`TRUE` = "solid", `FALSE` = "dashed"), guide = "none") +
+  coord_cartesian(xlim = c(-0.5, 3.7), ylim = c(-1.4, 1.4)) +
+  labs(caption = paste0(
+    "Transpiration proxy: ", diagram_proxy, ". Standardized coefficients; solid = 95% block-bootstrap CI excludes 0.\n",
+    "Covariates: rain (7 d, 30 d) and estuary level on the water table; rain and soil temperature on SWC; ",
+    "soil temperature on CH4.")) +
+  theme_void() +
+  theme(strip.text = element_text(size = 15, face = "bold"), legend.position = "top",
+        text = element_text(size = 13), plot.caption = element_text(hjust = 0, size = 10))
+print(fig_sem)
+ggsave("fig_SEM_path_diagram.png", fig_sem, width = 12, height = 5.5, dpi = 300, bg = "white")
+```
+# Leave-one-port-out sensitivity
+
+```{r}
+# Q6c. Does the lack of significance of the net treatment difference come from one atypical
+# port (e.g. the spring CH4 hot spot in port 6) rather than from the absence of an effect?
+#
+# Each port is removed in turn and the randomization tests are repeated with the remaining
+# 7 ports, keeping the real group sizes (3 vs 4): C(7, 3) = 35 assignments, so the smallest
+# possible one-sided p is 1/35 = 0.029. Tested statistics:
+#   - SEM: net transpiration effect on CH4 (diff_total, H1 < 0) and water-table -> SWC
+#     coupling (diff_wt_swc, H1 > 0), Control minus Root-free;
+#   - Direct test: Control x 30-d sap flux interaction with port and day effects (H1 < 0).
+# This is a sensitivity analysis decided after seeing the results: the main result is the
+# one with all 8 ports, and this table only shows how much each port drives it.
+# Needs port_daily, sem_drivers, fit_sem(), labelled_est(), true_control (SEM robustness)
+# and prep_dfe(), interaction_est() (Direct test and Causal tests).
+
+lopo_proxy <- "sap_cum30"   # 30-d mean sap flux, the main proxy
+
+# Daily medians for a set of "Control" ports, using only the ports in `pd`.
+assign_data_from <- function(pd, control_ports, pv) {
+  pd %>%
+    mutate(Treat = factor(if_else(PORT %in% control_ports, "Control", "Root-free"),
+                          levels = c("Control", "Root-free"))) %>%
+    group_by(DATE, Treat) %>%
+    summarise(swc = median(swc, na.rm = TRUE), fch4 = median(fch4, na.rm = TRUE),
+              ts = median(ts, na.rm = TRUE), .groups = "drop") %>%
+    left_join(sem_drivers %>% mutate(transp = .data[[pv]]), by = "DATE") %>%
+    dplyr::select(DATE, Treat, fch4, swc, ts, gwl, W, rain_7d, rain_30d, transp) %>%
+    filter(if_all(everything(), ~ !is.na(.x) & !is.nan(.x))) %>%
+    mutate(across(-c(DATE, Treat), z))
+}
+
+# One-sided randomization p and rank of the observed value among all assignments.
+rank_p <- function(perm, obs, lower = TRUE) {
+  hits <- if (lower) perm <= obs + 1e-12 else perm >= obs - 1e-12
+  c(p = mean(hits, na.rm = TRUE), rank = sum(hits, na.rm = TRUE), n = sum(!is.na(perm)))
+}
+
+d_direct_all <- prep_dfe(lopo_proxy)
+
+lopo_one <- function(drop_port) {
+  keep      <- setdiff(ports_all, drop_port)
+  ctrl_real <- intersect(true_control, keep)
+  assigns   <- combn(keep, length(ctrl_real), simplify = FALSE)
+  pd        <- filter(port_daily, PORT %in% keep)
+
+  # SEM statistics for every assignment of the remaining ports.
+  sem_stats <- purrr::map_dfr(assigns, function(a) {
+    fit <- tryCatch(suppressWarnings(fit_sem(assign_data_from(pd, a, lopo_proxy))), error = function(e) NULL)
+    est <- if (is.null(fit)) NULL else labelled_est(fit)
+    tibble(is_true = setequal(a, ctrl_real),
+           diff_total  = if (is.null(est)) NA_real_ else est[["diff_total"]],
+           diff_wt_swc = if (is.null(est)) NA_real_ else est[["diff_wt_swc"]])
+  })
+  obs_sem <- filter(sem_stats, is_true)
+
+  # Direct-test interaction for every assignment of the remaining ports.
+  d_dir <- d_direct_all %>% filter(as.character(PORT) %in% keep) %>% droplevels()
+  dir_stat <- function(a) interaction_est(d_dir, setNames(as.numeric(keep %in% a), keep))
+  dir_perm <- vapply(assigns, dir_stat, numeric(1))
+  dir_obs  <- dir_stat(ctrl_real)
+
+  r_tot <- rank_p(sem_stats$diff_total, obs_sem$diff_total, lower = TRUE)
+  r_wt  <- rank_p(sem_stats$diff_wt_swc, obs_sem$diff_wt_swc, lower = FALSE)
+  r_dir <- rank_p(dir_perm, dir_obs, lower = TRUE)
+  tibble(dropped_port = drop_port,
+         dropped_treat = port_treat$Treat[port_treat$PORT == drop_port],
+         n_assignments = length(assigns),
+         sem_diff_total = obs_sem$diff_total, p_diff_total = r_tot[["p"]], rank_diff_total = r_tot[["rank"]],
+         sem_diff_wt_swc = obs_sem$diff_wt_swc, p_diff_wt_swc = r_wt[["p"]], rank_diff_wt_swc = r_wt[["rank"]],
+         direct_interaction = dir_obs, p_direct = r_dir[["p"]], rank_direct = r_dir[["rank"]])
+}
+
+# Reference row with all 8 ports (70 assignments), from the earlier chunks.
+all_ports_row <- tibble(
+  dropped_port = "none", dropped_treat = "-", n_assignments = 70L,
+  sem_diff_total  = perm_sem_tbl$diff_total_obs[perm_sem_tbl$proxy == names(sem_proxy)[sem_proxy == lopo_proxy]],
+  p_diff_total    = perm_sem_tbl$p_diff_total[perm_sem_tbl$proxy == names(sem_proxy)[sem_proxy == lopo_proxy]],
+  sem_diff_wt_swc = perm_sem_tbl$diff_wt_swc_obs[perm_sem_tbl$proxy == names(sem_proxy)[sem_proxy == lopo_proxy]],
+  p_diff_wt_swc   = perm_sem_tbl$p_diff_wt_swc[perm_sem_tbl$proxy == names(sem_proxy)[sem_proxy == lopo_proxy]])
+
+lopo_tbl <- bind_rows(all_ports_row, purrr::map_dfr(ports_all, lopo_one)) %>%
+  mutate(across(c(sem_diff_total, sem_diff_wt_swc, direct_interaction), ~ round(.x, 3)),
+         across(starts_with("p_"), ~ round(.x, 3)))
+print(lopo_tbl, n = Inf, width = Inf)
+
+# Figure: one-sided p of each test when each port is removed (dashed line: p = 0.05;
+# dotted line: smallest possible p with 7 ports, 1/35).
+fig_lopo <- lopo_tbl %>%
+  filter(dropped_port != "none") %>%
+  tidyr::pivot_longer(c(p_diff_total, p_diff_wt_swc, p_direct), names_to = "test", values_to = "p") %>%
+  mutate(test = dplyr::recode(test,
+                              p_diff_total  = "SEM: net effect on CH4",
+                              p_diff_wt_swc = "SEM: water table -> SWC coupling",
+                              p_direct      = "Direct test: Control x sap flux"),
+         port = paste0("Port ", dropped_port, "\n(", dropped_treat, ")")) %>%
+  ggplot(aes(port, p, colour = test, group = test)) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = 1 / 35, linetype = "dotted", colour = "grey50") +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  scale_colour_manual(values = c("#7AD151FF", "#2A788EFF", "#440154FF")) +
+  labs(x = "Port removed", y = "Randomization p (one-sided)", colour = NULL) +
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 13))
+print(fig_lopo)
+ggsave("fig_leave_one_port_out.png", fig_lopo, width = 11, height = 5, dpi = 300, bg = "white")
+```
+# Water-table thresholds for the transpiration effect
+
+```{r}
+# Q7. Below which water-table depth does the transpiration -> SWC -> CH4 chain start to act?
+#
+# Idea: while the water table is shallow, capillary rise keeps the surface soil wet whatever
+# the trees do; once it drops below some depth, the surface soil dries and CH4 uptake rises.
+# Three steps, each fitted per treatment on daily treatment medians:
+#   (a) SWC vs water table: breakpoint where SWC starts to follow the water table
+#       (segmented regression; Muggeo 2003);
+#   (b) CH4 vs SWC (adjusted for soil temperature): breakpoint where drier soil starts to
+#       increase uptake;
+#   (c) transpiration effect on CH4 as a function of water-table depth (transpiration x
+#       water-table interaction): the depths at which that effect is clearly different from
+#       zero (Johnson-Neyman interval).
+# Breakpoint CIs come from a 14-day block bootstrap (daily values are autocorrelated).
+# Limit: days with the water table below the sensor (-0.49 m) are excluded from (a) and (c),
+# so any threshold deeper than -0.49 m cannot be detected.
+p_load(segmented)
+
+n_boot_thr <- 500
+
+thr_df <- resp_daily %>%
+  transmute(DATE, Treat, fch4, swc, ts, gwl = gwl_cens, transp = sap_cum30) %>%
+  filter(DATE >= win_start, DATE <= win_end)
+
+# Breakpoint fit: returns the breakpoint, the slopes on each side and Davies' test p
+# (H0: no change in slope). NULL when no breakpoint can be estimated.
+fit_break <- function(d, form, z) {
+  m0  <- lm(form, data = d)
+  seg <- tryCatch(suppressWarnings(segmented(m0, seg.Z = reformulate(z), psi = median(d[[z]]))),
+                  error = function(e) NULL)
+  if (is.null(seg) || is.null(seg$psi)) return(NULL)
+  sl <- slope(seg)[[z]]
+  list(psi = unname(seg$psi[1, "Est."]), slope_low = sl[1, "Est."], slope_high = sl[2, "Est."],
+       p_davies = davies.test(m0, seg.Z = reformulate(z))$p.value)
+}
+
+block_boot_break <- function(d, form, z, R = n_boot_thr) {
+  days   <- sort(unique(as.character(d$DATE)))
+  blocks <- split(days, ceiling(seq_along(days) / cv_block_days))
+  set.seed(42)
+  replicate(R, {
+    pick <- unlist(blocks[sample(seq_along(blocks), length(blocks), replace = TRUE)])
+    db   <- d[match(pick, as.character(d$DATE)), ]
+    b    <- fit_break(db, form, z)
+    if (is.null(b)) NA_real_ else b$psi
+  })
+}
+
+break_table <- function(form, z, label, data) {
+  purrr::map_dfr(c("Control", "Root-free"), function(tr) {
+    d <- data %>% filter(Treat == tr) %>% dplyr::select(DATE, all_of(all.vars(form))) %>% tidyr::drop_na()
+    b <- fit_break(d, form, z)
+    if (is.null(b)) return(tibble(relation = label, Treat = tr, n_days = nrow(d)))
+    bt <- block_boot_break(d, form, z)
+    tibble(relation = label, Treat = tr, n_days = nrow(d),
+           breakpoint = b$psi, ci_low = quantile(bt, 0.025, na.rm = TRUE), ci_high = quantile(bt, 0.975, na.rm = TRUE),
+           slope_below = b$slope_low, slope_above = b$slope_high, p_davies = b$p_davies)
+  })
+}
+
+# (a) SWC vs water table (m, relative to the ground), measured water-table days only.
+# (b) CH4 vs SWC, adjusted for soil temperature, all days.
+break_tbl <- bind_rows(
+  break_table(swc ~ gwl, "gwl", "SWC vs water table (m)", filter(thr_df, gwl > tr_floor)),
+  break_table(fch4 ~ swc + ts, "swc", "CH4 vs SWC (m3 m-3)", thr_df)) %>%
+  mutate(across(where(is.double), ~ signif(.x, 3)))
+print(break_tbl, width = Inf)
+
+# (c) Transpiration effect on CH4 conditional on the water-table depth. GLS with CAR(1)
+# errors; the conditional slope at depth g is b_transp + b_interaction * g, with its SE from
+# the coefficient covariance. Transpiration and temperature are standardized; the water
+# table stays in metres so the depths can be read directly.
+jn_curve <- function(tr) {
+  d <- thr_df %>% filter(Treat == tr, gwl > tr_floor) %>%
+    dplyr::select(DATE, fch4, transp, gwl, ts) %>% tidyr::drop_na() %>% arrange(DATE) %>%
+    mutate(transp_z = z(transp), ts_z = z(ts), day_num = as.numeric(DATE - min(DATE)))
+  m <- nlme::gls(fch4 ~ transp_z * gwl + ts_z, correlation = nlme::corCAR1(form = ~ day_num),
+                 data = d, control = nlme::glsControl(opt = "optim"))
+  b <- coef(m); V <- vcov(m)
+  tibble(Treat = tr, gwl = seq(min(d$gwl), max(d$gwl), length.out = 100)) %>%
+    mutate(slope = b[["transp_z"]] + b[["transp_z:gwl"]] * gwl,
+           se    = sqrt(V["transp_z", "transp_z"] + gwl^2 * V["transp_z:gwl", "transp_z:gwl"] +
+                          2 * gwl * V["transp_z", "transp_z:gwl"]),
+           lo = slope - 1.96 * se, hi = slope + 1.96 * se,
+           significant = sign(lo) == sign(hi),
+           p_interaction = summary(m)$tTable["transp_z:gwl", "p-value"])
+}
+jn <- purrr::map_dfr(c("Control", "Root-free"), jn_curve)
+
+# Depth ranges where the transpiration effect on CH4 is clearly negative (more uptake).
+jn %>%
+  filter(significant, slope < 0) %>%
+  group_by(Treat) %>%
+  summarise(shallowest_m = max(gwl), deepest_m = min(gwl), p_interaction = first(p_interaction), .groups = "drop") %>%
+  print()
+
+fig_thr_a <- thr_df %>% filter(gwl > tr_floor) %>%
+  ggplot(aes(gwl, swc, colour = Treat)) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  geom_vline(data = filter(break_tbl, relation == "SWC vs water table (m)"),
+             aes(xintercept = breakpoint, colour = Treat), linetype = "dashed") +
+  scale_colour_manual(values = treatment_colors) +
+  labs(x = "Water table (m, relative to ground)", y = bquote("SWC" ~ (m^3 ~ m^{-3})), colour = NULL, title = "(a)")
+
+fig_thr_b <- thr_df %>%
+  ggplot(aes(swc, fch4, colour = Treat)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_point(alpha = 0.4, size = 1.2) +
+  geom_vline(data = filter(break_tbl, relation == "CH4 vs SWC (m3 m-3)"),
+             aes(xintercept = breakpoint, colour = Treat), linetype = "dashed") +
+  scale_colour_manual(values = treatment_colors) +
+  labs(x = bquote("SWC" ~ (m^3 ~ m^{-3})), y = bquote(CH[4] ~ (mu*mol ~ m^{-2} ~ s^{-1})), colour = NULL, title = "(b)")
+
+fig_thr_c <- ggplot(jn, aes(gwl, slope, colour = Treat, fill = Treat)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, colour = NA) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = treatment_colors) + scale_fill_manual(values = treatment_colors) +
+  labs(x = "Water table (m, relative to ground)",
+       y = bquote("Effect of transpiration on" ~ CH[4] ~ "(per SD)"), colour = NULL, fill = NULL, title = "(c)")
+
+fig_thr <- (fig_thr_a | fig_thr_b | fig_thr_c) + patchwork::plot_layout(guides = "collect") &
+  theme(panel.grid = element_blank(), legend.position = "top", text = element_text(size = 12))
+print(fig_thr)
+ggsave("fig_water_table_thresholds.png", fig_thr, width = 14, height = 4.8, dpi = 300, bg = "white")
+
+
+```
+
+
